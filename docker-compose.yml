@@ -1,0 +1,14 @@
+version: '3.3'
+
+services:
+  app:
+    build: ./app
+    container_name: investment-monitor
+    restart: always
+    volumes:
+      - ./data:/app/data
+      - ./reports:/app/reports
+    environment:
+      - TZ=Asia/Shanghai
+    env_file:
+      - .env

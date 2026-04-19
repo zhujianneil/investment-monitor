@@ -1,0 +1,1 @@
+.env echo __pycache__/ echo *.pyc echo data/ echo reports/
