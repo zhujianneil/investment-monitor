@@ -147,12 +147,12 @@ PORTFOLIO = {
         'earnings_months': [3, 8],
     },
 
-    '02050.HK': {
-        'name': '健世科技',
-        'market': 'HK',
-        'yf_symbol': '2050.HK',
+    '002050': {
+        'name': '三花智控',
+        'market': 'CN',
+        'akshare_symbol': '002050',
         'monitor_type': 'EARNINGS_WAIT',
-        'news_keywords': ['健世科技', '瓣膜', '医疗器械', '临床', '三尖瓣'],
+        'news_keywords': ['三花智控', '机器人', '热管理', '新能源车', '特斯拉'],
         'earnings_months': [3, 8],
     },
 
