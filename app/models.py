@@ -66,6 +66,14 @@ def init_db():
         triggered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS system_status (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
     
     conn.commit()
     conn.close()
@@ -117,3 +125,18 @@ def save_announcement(symbol, title, url, pub_date, content=''):
         return True
     except:
         return False
+
+def update_heartbeat():
+    """更新心跳时间，供面板检查监控是否在线"""
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        cursor.execute('''
+            INSERT OR REPLACE INTO system_status (key, value, updated_at)
+            VALUES (?, ?, ?)
+        ''', ('last_heartbeat', 'running', now))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error updating heartbeat: {e}")
