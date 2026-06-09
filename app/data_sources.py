@@ -240,3 +240,178 @@ def health_check(symbols_to_test=None):
         except Exception as e:
             results[source_name] = {"ok": False, "error": str(e)[:100]}
     return results
+
+
+# ── A 股财报数据（2026-06-09 新增，解决 yfinance 没有 A 股财报的问题）───
+# 使用 akshare 同花顺接口 stock_financial_cash_ths，能拿到最新季度报告
+# 字段：'*经营活动产生的现金流量净额'、'购建固定资产、无形资产和其他长期资产支付的现金'
+
+def get_cn_financial(symbol6, retries=3, retry_delay=2):
+    """
+    获取 A 股最近 4 个季度的现金流量表数据（用于 TTM 计算）
+    返回: dict {report_period: '2026-03-31', ttm_ocf, ttm_capex, ttm_fcf, lag_days, periods_count}
+          失败返回 None
+
+    2026-06-09 重构：从单期改为 TTM（过去 12 个月滚动），加重试
+    """
+    import time as _time
+    last_error = None
+    for attempt in range(retries):
+        try:
+            import akshare as ak
+            from datetime import datetime as _dt
+
+            df = ak.stock_financial_cash_ths(symbol=symbol6)
+            if df is None or df.empty or len(df) < 4:
+                raise ValueError(f"akshare 返回数据不足：{len(df) if df is not None else 0} 期")
+
+            # 取最近 4 期
+            recent = df.head(4)
+
+            # 报告期
+            period_str = str(recent.iloc[0]['报告期'])[:10]
+            try:
+                period = _dt.strptime(period_str, "%Y-%m-%d")
+                lag_days = (_dt.now() - period).days
+            except Exception:
+                period = None
+                lag_days = 999
+
+            def _to_yuan(s):
+                if s is None:
+                    return None
+                if isinstance(s, (int, float)):
+                    return float(s)
+                s = str(s).strip()
+                if not s or s in ('False', 'True', 'nan'):
+                    return None
+                try:
+                    if '亿' in s:
+                        return float(s.replace('亿', '').replace(',', '')) * 1e8
+                    if '万' in s:
+                        return float(s.replace('万', '').replace(',', '')) * 1e4
+                    return float(s.replace(',', ''))
+                except Exception:
+                    return None
+
+            # TTM 累加：把"流出"（CapEx）转为负数，然后 sum
+            ttm_ocf = 0
+            ttm_capex = 0  # 存为负数
+            ocf_count = 0
+            capex_count = 0
+
+            for _, row in recent.iterrows():
+                ocf_v = _to_yuan(row.get('*经营活动产生的现金流量净额'))
+                if ocf_v is not None:
+                    ttm_ocf += ocf_v
+                    ocf_count += 1
+                capex_v = _to_yuan(row.get('购建固定资产、无形资产和其他长期资产支付的现金'))
+                if capex_v is not None:
+                    if capex_v > 0:
+                        capex_v = -capex_v
+                    ttm_capex += capex_v
+                    capex_count += 1
+
+            if ocf_count == 0:
+                raise ValueError("OCF 数据全空")
+
+            ttm_fcf = ttm_ocf + ttm_capex
+
+            return {
+                "report_period": period_str,
+                "ttm_ocf": ttm_ocf,
+                "ttm_capex": ttm_capex,
+                "ttm_fcf": ttm_fcf,
+                "fcf": ttm_fcf,  # 兼容旧字段名
+                "lag_days": lag_days,
+                "periods_count": ocf_count,
+            }
+        except Exception as e:
+            last_error = e
+            logger.warning(f"  [cn_financial] {symbol6} 第{attempt+1}次失败: {type(e).__name__}: {str(e)[:60]}")
+            if attempt < retries - 1:
+                _time.sleep(retry_delay * (attempt + 1))  # 指数退避
+            continue
+
+    logger.warning(f"  [cn_financial] {symbol6} 全部 {retries} 次失败: {last_error}")
+    return None
+
+
+def get_cn_balance_sheet(symbol6):
+    """
+    获取 A 股最新一期资产负债表（用于估算净现金）
+    返回: dict {report_period, cash: float (元), short_term_debt, long_term_debt, net_cash}
+    """
+    try:
+        import akshare as ak
+        df = ak.stock_financial_report_sina(stock=symbol6)
+        if df is None or df.empty or len(df) == 0:
+            return None
+
+        row = df.iloc[0]
+        cash = row.get('货币资金') or row.get('现金及存放中央银行款项')
+
+        def _to_yuan(v):
+            if v is None or v == '' or (isinstance(v, float) and v != v):  # NaN check
+                return 0
+            try:
+                return float(v)
+            except Exception:
+                return 0
+
+        cash_yuan = _to_yuan(cash)
+        short_debt = _to_yuan(row.get('短期借款'))
+        long_debt = _to_yuan(row.get('长期借款'))
+        bonds = _to_yuan(row.get('应付债券'))
+
+        total_debt = short_debt + long_debt + bonds
+        net_cash = cash_yuan - total_debt
+
+        return {
+            "cash": cash_yuan,
+            "short_debt": short_debt,
+            "long_debt": long_debt,
+            "bonds": bonds,
+            "total_debt": total_debt,
+            "net_cash": net_cash,
+        }
+    except Exception as e:
+        logger.warning(f"  [cn_bs] {symbol6} 失败: {type(e).__name__}: {str(e)[:80]}")
+        return None
+
+
+# ── 美股/港股净现金估算（2026-06-09 新增）───
+def get_net_cash_us_hk(yf_symbol):
+    """
+    用 yfinance 估算净现金（仅港股/美股）
+    返回: float 净现金（元，yfinance 默认报告币种）
+    """
+    try:
+        ticker = yf.Ticker(yf_symbol)
+        bs = ticker.balance_sheet
+        if bs is None or bs.empty:
+            return 0
+
+        # 最新一期
+        col = bs.columns[0]
+        cash = 0
+        debt = 0
+
+        # 现金字段（按常见名）
+        for kw in ['Cash And Cash Equivalents', 'Cash Cash Equivalents And Short Term Investments']:
+            if kw in bs.index:
+                v = bs.loc[kw].iloc[0]
+                if v is not None and not (isinstance(v, float) and v != v):
+                    cash = float(v)
+                break
+
+        # 债务字段
+        for kw in ['Short Term Debt', 'Current Debt', 'Long Term Debt']:
+            if kw in bs.index:
+                v = bs.loc[kw].iloc[0]
+                if v is not None and not (isinstance(v, float) and v != v):
+                    debt += float(v)
+
+        return cash - debt
+    except Exception:
+        return 0
