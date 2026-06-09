@@ -16,7 +16,9 @@ from stock_monitor import monitor_stocks
 from news_monitor import monitor_news
 from earnings_calendar import check_earnings_calendar
 from weekly_digest import send_weekly_report
-from models import init_db, update_heartbeat
+from models import init_db, update_heartbeat, get_recent_source_failures
+from data_sources import health_check as ds_health_check, get_source_health
+from feishu_push import _send
 
 tz = pytz.timezone('Asia/Shanghai')
 
@@ -40,6 +42,38 @@ def job_weekly_digest():
     """每周日：周报推送"""
     print("\n>>> [每周] 周报生成")
     send_weekly_report()
+    update_heartbeat()
+
+
+def job_data_source_health():
+    """
+    数据源健康检查（2026-06-09 新增）
+    每 6 小时跑一次，发现所有源都不可用时推送告警
+    """
+    print("\n>>> [健康检查] 数据源可用性")
+    hc = ds_health_check()
+    print(f"  检查结果: {hc}")
+
+    # 统计：所有源都不可用 = 紧急
+    ok_count = sum(1 for v in hc.values() if v.get("ok"))
+    if ok_count == 0:
+        # 紧急：所有 A 股数据源都挂了
+        lines = ["**🚨 A 股数据源全部失效**\n"]
+        lines.append("所有 A 股数据源都不可用，A 股监控已失效。\n")
+        lines.append("**当前状态**：")
+        for src, status in hc.items():
+            lines.append(f"- `{src}`: {status}")
+        lines.append("\n**建议**：")
+        lines.append("1. 登录服务器检查容器日志：`docker logs investment-monitor`")
+        lines.append("2. 测试新浪源：`curl -H 'Referer: https://finance.sina.com.cn' 'https://hq.sinajs.cn/list=sh600036'`")
+        lines.append("3. 如果是网络问题，检查 Oracle 安全组是否封了 443 端口")
+        content = "\n".join(lines)
+        _send("🚨 数据源紧急告警", content, "red")
+    elif ok_count < len(hc):
+        # 部分源失效，不致命但要记录
+        failed = [k for k, v in hc.items() if not v.get("ok")]
+        print(f"  部分源失效: {failed}（系统仍可用，仅记录）")
+
     update_heartbeat()
 
 
@@ -79,6 +113,14 @@ def start():
         CronTrigger(day_of_week='sun', hour='20', minute='0', timezone=tz),
         id='weekly_digest',
         name='每周摘要',
+    )
+
+    # ── 数据源健康检查（每 6 小时，2026-06-09 新增）──
+    scheduler.add_job(
+        job_data_source_health,
+        CronTrigger(hour='*/6', minute='0', timezone=tz),
+        id='data_source_health',
+        name='数据源健康检查',
     )
 
     print("=" * 55)
