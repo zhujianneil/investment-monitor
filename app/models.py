@@ -86,19 +86,99 @@ def init_db():
     )
     ''')
 
+    # 监控运行健康表（2026-06-11 L3 防御新增）
+    # 记录每轮监控的成败、处理的 symbol 数、关键异常摘要
+    # 供 watchdog 任务判断"是否连续多轮无成功"
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS monitor_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_name TEXT NOT NULL,
+        status TEXT NOT NULL,           -- 'ok' | 'partial' | 'failed'
+        symbols_processed INTEGER DEFAULT 0,
+        symbols_failed INTEGER DEFAULT 0,
+        last_error TEXT,
+        started_at TIMESTAMP,
+        finished_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+
     conn.commit()
     conn.close()
     print("数据库初始化完成")
 
+
+# ── 监控运行健康（2026-06-11 新增）───────────────────────────
+
+def record_monitor_run(job_name, status, symbols_processed=0, symbols_failed=0, last_error=None, started_at=None):
+    """记录一轮监控的运行结果。status ∈ {'ok','partial','failed'}"""
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO monitor_runs
+              (job_name, status, symbols_processed, symbols_failed, last_error, started_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (job_name, status, symbols_processed, symbols_failed,
+              (last_error or '')[:500] if last_error else None,
+              started_at))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"  [record_monitor_run] 失败: {e}")
+
+
+def get_recent_monitor_runs(job_name, limit=5):
+    """取最近 N 条某 job 的运行记录（最新在前）"""
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM monitor_runs
+            WHERE job_name = ?
+            ORDER BY id DESC LIMIT ?
+        ''', (job_name, limit))
+        rows = [dict(r) for r in cursor.fetchall()]
+        conn.close()
+        return rows
+    except Exception as e:
+        print(f"  [get_recent_monitor_runs] 失败: {e}")
+        return []
+
 def save_price(symbol, price, change_pct, volume):
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO prices (symbol, price, change_pct, volume)
-        VALUES (?, ?, ?, ?)
-    ''', (symbol, price, change_pct, volume))
-    conn.commit()
-    conn.close()
+    """
+    保存价格快照。2026-06-11 加固：防御 price=None/NaN（避免 IntegrityError 整轮崩），
+    volume None/非数值 → 0。
+    返回 True=成功，False=跳过（数据无效）。
+    """
+    import math
+    # price 是 NOT NULL，遇到 None/NaN/非有限值直接跳过
+    if price is None or (isinstance(price, float) and (math.isnan(price) or math.isinf(price))):
+        print(f"  [save_price] 跳过 {symbol}：price 无效 ({price!r})")
+        return False
+    # change_pct 容错
+    if change_pct is not None and isinstance(change_pct, float) and (math.isnan(change_pct) or math.isinf(change_pct)):
+        change_pct = 0.0
+    # volume 容错
+    if volume is None:
+        volume = 0
+    elif not isinstance(volume, (int, float)):
+        try:
+            volume = int(volume)
+        except (ValueError, TypeError):
+            volume = 0
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO prices (symbol, price, change_pct, volume)
+            VALUES (?, ?, ?, ?)
+        ''', (symbol, float(price), change_pct, volume))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"  [save_price] 写入 {symbol} 失败（不致命）: {type(e).__name__}: {e}")
+        return False
 
 def get_last_alert_time(symbol, alert_type, hours=24):
     conn = get_db()

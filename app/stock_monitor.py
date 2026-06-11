@@ -324,58 +324,79 @@ def monitor_stocks():
         total = len(cn_codes_to_fetch)
         print(f"  A股批量拉取：{ok}/{total} 只成功")
 
+    # 2026-06-11 L1 防御：每只 symbol 独立 try/except，一只崩不连累整轮
     for symbol, cfg in PORTFOLIO.items():
-        name = cfg['name']
-
-        # EXIT_PENDING：2026-06-11 改为参与异常波动检测（用户要求"所有股票都告诉"）
-        # FCF/估值逻辑继续跳过（退出项不参与估值）
-        is_exit_pending = cfg['monitor_type'] == 'EXIT_PENDING'
-
-        # ── 1. 获取当前价格 ──
-        if cfg['market'] == 'CN':
-            # A股走批量缓存路径，避免重复 HTTP 请求
-            code = cfg.get('akshare_symbol', symbol)
-            data = cn_quotes_cache.get(code)
-            if data:
-                data = {'price': data['price'], 'change_pct': data['change_pct'], 'volume': data['volume']}
-        else:
-            data = get_price(symbol, cfg)
-
-        if not data:
-            print(f"  {name}({symbol}): 无法获取价格")
+        try:
+            _process_one_stock(symbol, cfg, cn_quotes_cache)
+        except Exception as e:
+            print(f"  ✗✗ {symbol} 监控异常（已隔离）: {type(e).__name__}: {str(e)[:200]}")
+            print(f"     本只股票本次跳过，其他股票继续处理")
             continue
 
-        price = data['price']
-        change_pct = data['change_pct']
-        save_price(symbol, price, change_pct, data['volume'])
+    print(f"\n  本轮完成 — 异常波动 {anomaly_count} 条，FCF 触发 {fcf_count} 条")
+    return anomaly_count, fcf_count
 
-        direction = "↑" if change_pct > 0 else "↓"
-        print(f"  {name}({symbol}): {price:.2f}  {direction}{abs(change_pct)*100:.2f}%", end="")
 
-        # ── 2. 异常波动检测（被动提示，不是交易信号）──
-        # 2026-06-11：用户要求"所有股票波动 > 3.5% 都要告警"
-        threshold = 0.035  # 强制 3.5%，覆盖个股 anomaly_threshold
-        if abs(change_pct) >= threshold:
-            if not get_last_alert_time(symbol, 'anomaly', hours=8):
-                exit_tag = " [退出项]" if is_exit_pending else ""
-                msg = f"单日波动 {change_pct*100:+.2f}%（≥3.5%）{exit_tag}，建议查看是否有相关新闻，但无需立即行动"
-                send_anomaly_alert(name, symbol, price, change_pct)
-                save_alert(symbol, 'ANOMALY', msg)
-                print(f"  ⚡ 异常波动", end="")
-                anomaly_count += 1
+def _process_one_stock(symbol, cfg, cn_quotes_cache):
+    """
+    处理单只股票的完整监控流程（2026-06-11 抽离出来做 L1 防御）。
+    任意异常向上抛，由 monitor_stocks 的 try/except 隔离。
+    """
+    name = cfg['name']
 
-        # ── FCF 估值逻辑：退出项跳过 ──
-        if is_exit_pending:
-            print()
-            continue
+    # EXIT_PENDING：2026-06-11 改为参与异常波动检测（用户要求"所有股票都告诉"）
+    # FCF/估值逻辑继续跳过（退出项不参与估值）
+    is_exit_pending = cfg['monitor_type'] == 'EXIT_PENDING'
 
-        # ── 3. FCF 倍数阈值检测（VALUE_WATCHER 专用）──
-        if cfg['monitor_type'] == 'VALUE_WATCHER':
-            fcf_cfg = cfg.get('fcf', {})
-            market = cfg['market']
+    # ── 1. 获取当前价格 ──
+    if cfg['market'] == 'CN':
+        # A股走批量缓存路径，避免重复 HTTP 请求
+        code = cfg.get('akshare_symbol', symbol)
+        data = cn_quotes_cache.get(code)
+        if data:
+            data = {'price': data['price'], 'change_pct': data['change_pct'], 'volume': data['volume']}
+    else:
+        data = get_price(symbol, cfg)
 
-            # ── 3a. 根据市场选择不同的 FCF 计算路径（2026-06-09 重构）──
-            fcf_data = None
+    if not data:
+        print(f"  {name}({symbol}): 无法获取价格")
+        return 0, 0
+
+    price = data['price']
+    change_pct = data['change_pct']
+    save_price(symbol, price, change_pct, data['volume'])
+
+    direction = "↑" if change_pct > 0 else "↓"
+    print(f"  {name}({symbol}): {price:.2f}  {direction}{abs(change_pct)*100:.2f}%", end="")
+
+    anomaly_count = 0
+    fcf_count = 0
+
+    # ── 2. 异常波动检测（被动提示，不是交易信号）──
+    # 2026-06-11：用户要求"所有股票波动 > 3.5% 都要告警"
+    threshold = 0.035  # 强制 3.5%，覆盖个股 anomaly_threshold
+    if abs(change_pct) >= threshold:
+        if not get_last_alert_time(symbol, 'anomaly', hours=8):
+            exit_tag = " [退出项]" if is_exit_pending else ""
+            msg = f"单日波动 {change_pct*100:+.2f}%（≥3.5%）{exit_tag}，建议查看是否有相关新闻，但无需立即行动"
+            send_anomaly_alert(name, symbol, price, change_pct)
+            save_alert(symbol, 'ANOMALY', msg)
+            print(f"  ⚡ 异常波动", end="")
+            anomaly_count += 1
+
+    # ── FCF 估值逻辑：退出项跳过 ──
+    if is_exit_pending:
+        print()
+        return anomaly_count, fcf_count
+
+    # ── 3. FCF 倍数阈值检测（VALUE_WATCHER 专用）──
+    if cfg['monitor_type'] == 'VALUE_WATCHER':
+        fcf_cfg = cfg.get('fcf', {})
+        market = cfg['market']
+
+        # ── 3a. 根据市场选择不同的 FCF 计算路径（2026-06-09 重构 + 2026-06-11 L1 防御）──
+        fcf_data = None
+        try:
             if market == 'CN':
                 # A股用 akshare 接口
                 code = cfg.get('akshare_symbol', symbol)
@@ -385,58 +406,60 @@ def monitor_stocks():
                 yf_sym = cfg.get('yf_symbol')
                 if yf_sym:
                     fcf_data = get_fcf_multiple(yf_sym, price)
+        except Exception as e:
+            print(f"  [FCF] {symbol} 计算异常（已隔离）: {type(e).__name__}: {str(e)[:120]}", end="")
+            fcf_data = None
 
-            # ── 3b. 输出 + 陈旧/极端数据保护（2026-06-09 新增）──
-            if fcf_data:
-                fcf_mult = fcf_data['fcf_multiple']
-                ev_fcf = fcf_data.get('ev_fcf_multiple')
-                lag = fcf_data.get('lag_days', 0)
-                is_stale = fcf_data.get('stale', False)
+        # ── 3b. 输出 + 陈旧/极端数据保护（2026-06-09 新增）──
+        if fcf_data:
+            fcf_mult = fcf_data['fcf_multiple']
+            ev_fcf = fcf_data.get('ev_fcf_multiple')
+            lag = fcf_data.get('lag_days', 0)
+            is_stale = fcf_data.get('stale', False)
 
-                # 打印
-                staleness_tag = f" [数据滞后{lag}天]" if is_stale else ""
-                ev_tag = f", EV/FCF={ev_fcf:.1f}x" if ev_fcf else ""
-                print(f"  FCF={fcf_mult:.1f}x{ev_tag}{staleness_tag}", end="")
+            # 打印
+            staleness_tag = f" [数据滞后{lag}天]" if is_stale else ""
+            ev_tag = f", EV/FCF={ev_fcf:.1f}x" if ev_fcf else ""
+            print(f"  FCF={fcf_mult:.1f}x{ev_tag}{staleness_tag}", end="")
 
-                # 保护：如果数据陈旧或倍数极端，卖出信号只记录不推送
-                skip_push = is_stale or (fcf_mult and fcf_mult > EXTREME_MULTIPLE)
+            # 保护：如果数据陈旧或倍数极端，卖出信号只记录不推送
+            skip_push = is_stale or (fcf_mult and fcf_mult > EXTREME_MULTIPLE)
 
-                buy_t = fcf_cfg.get('buy')
-                cc_t = fcf_cfg.get('covered_call')
-                sell_t = fcf_cfg.get('sell') or fcf_cfg.get('hard_sell')
+            buy_t = fcf_cfg.get('buy')
+            cc_t = fcf_cfg.get('covered_call')
+            sell_t = fcf_cfg.get('sell') or fcf_cfg.get('hard_sell')
 
-                if buy_t and fcf_mult <= buy_t:
-                    if not get_last_alert_time(symbol, 'FCF_BUY', hours=24):
-                        msg = f"FCF {fcf_mult:.1f}x ≤ 买入线 {buy_t}x → 执行四条件清单"
-                        send_fcf_threshold_alert(name, symbol, 'buy', fcf_mult, price, buy_t)
-                        save_alert(symbol, 'FCF_BUY', msg)
+            if buy_t and fcf_mult <= buy_t:
+                if not get_last_alert_time(symbol, 'FCF_BUY', hours=24):
+                    msg = f"FCF {fcf_mult:.1f}x ≤ 买入线 {buy_t}x → 执行四条件清单"
+                    send_fcf_threshold_alert(name, symbol, 'buy', fcf_mult, price, buy_t)
+                    save_alert(symbol, 'FCF_BUY', msg)
+                    fcf_count += 1
+
+            elif cc_t and fcf_mult >= cc_t and (not sell_t or fcf_mult < sell_t):
+                if not get_last_alert_time(symbol, 'FCF_COVERED_CALL', hours=24):
+                    msg = f"FCF {fcf_mult:.1f}x ≥ {cc_t}x → 考虑卖出 covered call"
+                    send_fcf_threshold_alert(name, symbol, 'covered_call', fcf_mult, price, cc_t)
+                    save_alert(symbol, 'FCF_COVERED_CALL', msg)
+                    fcf_count += 1
+
+            elif sell_t and fcf_mult >= sell_t:
+                if not get_last_alert_time(symbol, 'FCF_SELL', hours=24):
+                    if skip_push:
+                        # 数据陈旧或极端倍数 → 只记录，不推送飞书
+                        reason = "数据陈旧" if is_stale else f"倍数极端(>{EXTREME_MULTIPLE}x)"
+                        msg = f"⚠️ FCF {fcf_mult:.1f}x 触发卖出线 {sell_t}x，但因{reason}（报告期 {fcf_data.get('report_period')}，滞后 {lag} 天），仅记录不推送"
+                        save_alert(symbol, 'FCF_SELL_STALE', msg)
+                        print(f"  🔇 卖出信号[抑制推送：{reason}]", end="")
+                    else:
+                        msg = f"FCF {fcf_mult:.1f}x ≥ 卖出线 {sell_t}x → 执行减仓/清仓清单"
+                        send_fcf_threshold_alert(name, symbol, 'sell', fcf_mult, price, sell_t)
+                        save_alert(symbol, 'FCF_SELL', msg)
                         fcf_count += 1
+        elif market == 'CN':
+            # A股但拿不到数据（akshare 接口失败）
+            print(f"  [FCF 数据缺失]", end="")
 
-                elif cc_t and fcf_mult >= cc_t and (not sell_t or fcf_mult < sell_t):
-                    if not get_last_alert_time(symbol, 'FCF_COVERED_CALL', hours=24):
-                        msg = f"FCF {fcf_mult:.1f}x ≥ {cc_t}x → 考虑卖出 covered call"
-                        send_fcf_threshold_alert(name, symbol, 'covered_call', fcf_mult, price, cc_t)
-                        save_alert(symbol, 'FCF_COVERED_CALL', msg)
-                        fcf_count += 1
-
-                elif sell_t and fcf_mult >= sell_t:
-                    if not get_last_alert_time(symbol, 'FCF_SELL', hours=24):
-                        if skip_push:
-                            # 数据陈旧或极端倍数 → 只记录，不推送飞书
-                            reason = "数据陈旧" if is_stale else f"倍数极端(>{EXTREME_MULTIPLE}x)"
-                            msg = f"⚠️ FCF {fcf_mult:.1f}x 触发卖出线 {sell_t}x，但因{reason}（报告期 {fcf_data.get('report_period')}，滞后 {lag} 天），仅记录不推送"
-                            save_alert(symbol, 'FCF_SELL_STALE', msg)
-                            print(f"  🔇 卖出信号[抑制推送：{reason}]", end="")
-                        else:
-                            msg = f"FCF {fcf_mult:.1f}x ≥ 卖出线 {sell_t}x → 执行减仓/清仓清单"
-                            send_fcf_threshold_alert(name, symbol, 'sell', fcf_mult, price, sell_t)
-                            save_alert(symbol, 'FCF_SELL', msg)
-                            fcf_count += 1
-            elif market == 'CN':
-                # A股但拿不到数据（akshare 接口失败）
-                print(f"  [FCF 数据缺失]", end="")
-
-        print()   # 换行
-
-    print(f"\n  本轮完成 — 异常波动 {anomaly_count} 条，FCF 触发 {fcf_count} 条")
+    print()   # 换行
     return anomaly_count, fcf_count
+

@@ -9,14 +9,22 @@ FEISHU_WEBHOOK_BACKUP = os.getenv('FEISHU_WEBHOOK_BACKUP')  # 可选：failover 
 FEISHU_MAX_RETRIES = int(os.getenv('FEISHU_MAX_RETRIES', '3'))
 FEISHU_RETRY_BACKOFF = float(os.getenv('FEISHU_RETRY_BACKOFF', '0.5'))  # 秒，指数退避基数
 
-# 获取项目根目录 (investment-monitor/)
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.path.join(BASE_DIR, 'data', 'investment.db')
-REPORTS_PATH = os.path.join(BASE_DIR, 'reports')
-FEISHU_DLQ_PATH = os.path.join(BASE_DIR, 'data', 'feishu_dlq.jsonl')
+# 数据/报告目录（2026-06-11 修复路径 bug）
+# 旧代码：os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+#   → 容器内 = "/"（因为 __file__=/app/app/config.py，dirname dirname = /）
+#   → DB_PATH=/data/investment.db（容器内 ephemeral，重启即丢！）
+# 新逻辑：优先使用 /app/data（与 docker-compose 的 volumes 挂载一致），
+#   仅在 /app/data 不可写时降级到 /tmp 兜底（开发模式）
+_BASE_CANDIDATE = '/app/data'
+if not os.path.isdir(_BASE_CANDIDATE) or not os.access(_BASE_CANDIDATE, os.W_OK):
+    _BASE_CANDIDATE = '/tmp/investment-monitor'
+BASE_DIR = _BASE_CANDIDATE
+DB_PATH = os.path.join(BASE_DIR, 'investment.db')
+REPORTS_PATH = os.path.join('/app/reports' if os.path.isdir('/app/reports') else os.path.join(BASE_DIR, '..', 'reports'), '')
+FEISHU_DLQ_PATH = os.path.join(BASE_DIR, 'feishu_dlq.jsonl')
 
-os.makedirs(os.path.join(BASE_DIR, 'data'), exist_ok=True)
-os.makedirs(REPORTS_PATH, exist_ok=True)
+os.makedirs(BASE_DIR, exist_ok=True)
+os.makedirs(os.path.dirname(REPORTS_PATH) or '.', exist_ok=True)
 
 # ============================================================
 # 持仓 & 观察名单 深度同步

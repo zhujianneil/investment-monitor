@@ -81,53 +81,66 @@ def monitor_news():
     print(f"  新闻 & 公告监控 — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"{'='*55}")
 
-    total_new = 0
+    total_new_ref = [0]  # 列表包装便于内层函数修改
 
     for symbol, cfg in PORTFOLIO.items():
-        name         = cfg['name']
-        market       = cfg['market']
-        monitor_type = cfg['monitor_type']
-        keywords     = cfg.get('news_keywords', [])
-
-        # EXIT_PENDING：跳过
-        if monitor_type == 'EXIT_PENDING':
+        # 2026-06-11 L1 防御：每只 symbol 独立 try/except，一只崩不连累整轮
+        try:
+            _process_one_news(symbol, cfg, total_new_ref)
+        except Exception as e:
+            print(f"  ✗✗ {symbol} 新闻处理异常（已隔离）: {type(e).__name__}: {str(e)[:200]}")
             continue
 
-        # EARNINGS_WAIT 且无关键词：也跳过日常新闻
-        if monitor_type == 'EARNINGS_WAIT' and not keywords:
-            continue
+    print(f"\n  新闻监控完成 — 新内容 {total_new_ref[0]} 条")
+    return total_new_ref[0]
 
-        print(f"\n  [{monitor_type}] {name}({symbol}) — 关键词: {keywords[:3]}...")
 
-        # ── A 股：公告 + 关键词过滤 ──
-        if market == 'CN':
-            akshare_sym = cfg.get('akshare_symbol', symbol)
-            # EVENT_DRIVEN：不过滤，捕获所有公告
-            kws = [] if monitor_type == 'EVENT_DRIVEN' else keywords
-            announcements = get_cn_announcements(akshare_sym, name, kws)
+def _process_one_news(symbol, cfg, total_new_ref):
+    """
+    处理单只持仓的新闻/公告流程（2026-06-11 L1 防御抽离）。
+    total_new_ref 是 [int] 包装（list 是 Python 跨闭包修改的标准技巧）。
+    """
+    name         = cfg['name']
+    market       = cfg['market']
+    monitor_type = cfg['monitor_type']
+    keywords     = cfg.get('news_keywords', [])
 
-            for ann in announcements:
-                is_new = save_announcement(symbol, ann['title'], ann['url'], ann['pub_date'])
-                if is_new:
-                    print(f"    ✦ [新公告] {ann['title'][:50]}")
-                    send_announcement_alert(name, symbol, ann['title'], ann['url'])
-                    total_new += 1
+    # EXIT_PENDING：跳过
+    if monitor_type == 'EXIT_PENDING':
+        return
 
-        # ── 港股 / 美股：yfinance 新闻 ──
-        else:
-            yf_sym = cfg.get('yf_symbol', symbol)
-            # EVENT_DRIVEN：关键词密集，宁滥勿缺
-            kws = keywords if monitor_type == 'EVENT_DRIVEN' else keywords
-            news_items = get_yf_news(yf_sym, name, kws)
+    # EARNINGS_WAIT 且无关键词：也跳过日常新闻
+    if monitor_type == 'EARNINGS_WAIT' and not keywords:
+        return
 
-            for item in news_items:
-                is_new = save_announcement(symbol, item['title'], item['url'], item['pub_date'])
-                if is_new:
-                    print(f"    ✦ [新闻] {item['title'][:60]}")
-                    # EVENT_DRIVEN 单独推送，其他持仓汇总到周报
-                    if monitor_type == 'EVENT_DRIVEN':
-                        send_keyword_news_alert(name, symbol, item['title'], item['url'], keywords)
-                    total_new += 1
+    print(f"\n  [{monitor_type}] {name}({symbol}) — 关键词: {keywords[:3]}...")
 
-    print(f"\n  新闻监控完成 — 新内容 {total_new} 条")
-    return total_new
+    # ── A 股：公告 + 关键词过滤 ──
+    if market == 'CN':
+        akshare_sym = cfg.get('akshare_symbol', symbol)
+        # EVENT_DRIVEN：不过滤，捕获所有公告
+        kws = [] if monitor_type == 'EVENT_DRIVEN' else keywords
+        announcements = get_cn_announcements(akshare_sym, name, kws)
+
+        for ann in announcements:
+            is_new = save_announcement(symbol, ann['title'], ann['url'], ann['pub_date'])
+            if is_new:
+                print(f"    ✦ [新公告] {ann['title'][:50]}")
+                send_announcement_alert(name, symbol, ann['title'], ann['url'])
+                total_new_ref[0] += 1
+
+    # ── 港股 / 美股：yfinance 新闻 ──
+    else:
+        yf_sym = cfg.get('yf_symbol', symbol)
+        # EVENT_DRIVEN：关键词密集，宁滥勿缺
+        kws = keywords if monitor_type == 'EVENT_DRIVEN' else keywords
+        news_items = get_yf_news(yf_sym, name, kws)
+
+        for item in news_items:
+            is_new = save_announcement(symbol, item['title'], item['url'], item['pub_date'])
+            if is_new:
+                print(f"    ✦ [新闻] {item['title'][:60]}")
+                # EVENT_DRIVEN 单独推送，其他持仓汇总到周报
+                if monitor_type == 'EVENT_DRIVEN':
+                    send_keyword_news_alert(name, symbol, item['title'], item['url'], keywords)
+                total_new_ref[0] += 1

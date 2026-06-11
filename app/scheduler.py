@@ -7,27 +7,81 @@ scheduler.py — 任务调度
   每个交易日（盘中）：只检测异常波动 + FCF 阈值
   每天（早晨）      ：新闻 & 公告扫描 + 财报日历检查
   每周日（下午）    ：周报摘要推送
+
+2026-06-11 三层防御加固：
+  L1: 各 job 内的循环给单只 symbol/单条新闻包 try/except（详见 stock_monitor.py / news_monitor.py）
+  L2: 每个 job 外层包 try/except + 写 monitor_runs 表 + 飞书告警"本轮崩溃"
+  L3: 新增 watch_dog 任务，每 2 小时检查最近 N 轮是否全是 failed/partial
+      + 启动时调用一次 replay_dlq()，自动重放历史失败的消息
 """
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
+from datetime import datetime
 import pytz
 
 from stock_monitor import monitor_stocks
 from news_monitor import monitor_news
 from earnings_calendar import check_earnings_calendar
 from weekly_digest import send_weekly_report
-from models import init_db, update_heartbeat, get_recent_source_failures
-from data_sources import health_check as ds_health_check, get_source_health
-from feishu_push import _send
+from models import (
+    init_db, update_heartbeat, get_recent_source_failures,
+    record_monitor_run, get_recent_monitor_runs,
+)
+from data_sources import health_check as ds_health_check
+from feishu_push import _send, replay_dlq
 
 tz = pytz.timezone('Asia/Shanghai')
 
 
+# ── 通用包装器：L2 防御（2026-06-11 新增）─────────────────────
+def _wrap(job_name, fn):
+    """
+    把 job 函数包成"外层 try/except + 健康记录 + 飞书告警"。
+    - 正常完成 → 写 monitor_runs(status=ok)
+    - 异常但部分处理完成 → status=partial
+    - 整体崩溃 → status=failed + 飞书红色告警
+    """
+    started_at = datetime.now().isoformat(timespec='seconds')
+    symbols_processed = 0
+    last_err = None
+    try:
+        result = fn()
+        # 多数 job 返回 (anomaly, fcf) 元组；news 返回 int；其他返回 None
+        if isinstance(result, tuple):
+            symbols_processed = sum(x for x in result if isinstance(x, int))
+        elif isinstance(result, int):
+            symbols_processed = result
+        record_monitor_run(job_name, 'ok', symbols_processed=symbols_processed,
+                          symbols_failed=0, started_at=started_at)
+        update_heartbeat()
+        return result
+    except Exception as e:
+        last_err = f"{type(e).__name__}: {str(e)[:300]}"
+        print(f"  ✗✗ {job_name} 整体崩溃: {last_err}")
+        record_monitor_run(job_name, 'failed', symbols_processed=0,
+                          symbols_failed=0, last_error=last_err, started_at=started_at)
+        # 飞书红色告警（告警本身如果失败，进 DLQ 等待重放）
+        _send(
+            f"🚨 监控任务崩溃 — {job_name}",
+            f"**任务**：{job_name}\n"
+            f"**开始时间**：{started_at}\n"
+            f"**异常**：\n```\n{last_err}\n```\n\n"
+            f"**自动恢复**：本次崩溃已隔离。容器仍存活，下一时点 (≤2小时) 会重试。\n"
+            f"**人工处理**：\n"
+            f"1. `docker logs investment-monitor --since 1h | tail -100`\n"
+            f"2. `sqlite3 /opt/investment-monitor/data/investment.db 'SELECT * FROM monitor_runs ORDER BY id DESC LIMIT 5;'`\n",
+            'red'
+        )
+        update_heartbeat()
+        return None
+
+
+# ── 各 job 包装 ────────────────────────────────────────────
+
 def job_market_monitor():
     """交易时段：异常波动 + FCF 阈值检测"""
     print("\n>>> [交易时段] 价格 & FCF 监控")
-    monitor_stocks()
-    update_heartbeat()
+    return monitor_stocks()
 
 
 def job_daily_news():
@@ -35,14 +89,12 @@ def job_daily_news():
     print("\n>>> [每日] 新闻公告扫描")
     monitor_news()
     check_earnings_calendar()
-    update_heartbeat()
 
 
 def job_weekly_digest():
     """每周日：周报推送"""
     print("\n>>> [每周] 周报生成")
     send_weekly_report()
-    update_heartbeat()
 
 
 def job_data_source_health():
@@ -74,6 +126,48 @@ def job_data_source_health():
         failed = [k for k, v in hc.items() if not v.get("ok")]
         print(f"  部分源失效: {failed}（系统仍可用，仅记录）")
 
+
+def job_watchdog():
+    """
+    L3 看门狗（2026-06-11 新增）。
+    每 2 小时检查一次：最近 3 轮监控是否全部 failed/partial + 至少 1 轮 failed
+    → 说明系统持续异常，需要"叫醒人"。
+    """
+    print("\n>>> [看门狗] 系统健康度自检")
+
+    # 1) 连续失败检测
+    recent = get_recent_monitor_runs('market_monitor', limit=3)
+    if recent and len(recent) >= 2:
+        # 最新一轮是 failed 且前几轮连续 ≤1 ok → 升级
+        all_bad = all(r['status'] in ('failed', 'partial') for r in recent)
+        if all_bad:
+            lines = ["**🚨 监控连续 2+ 轮未成功**\n"]
+            lines.append("**最近运行记录**：\n")
+            for r in recent:
+                lines.append(
+                    f"- `{r['finished_at']}` status={r['status']} "
+                    f"处理 {r.get('symbols_processed', 0)} 只，"
+                    f"失败 {r.get('symbols_failed', 0)} 只"
+                )
+                if r.get('last_error'):
+                    lines.append(f"  - 错误：`{r['last_error'][:200]}`")
+            lines.append("\n**可能原因**：")
+            lines.append("- 所有 A 股数据源被封")
+            lines.append("- 数据库表损坏 / 锁死")
+            lines.append("- 容器内 Python 环境异常")
+            lines.append("\n**下一步**：")
+            lines.append("1. `docker exec investment-monitor python3 -c 'from data_sources import health_check; print(health_check())'`")
+            lines.append("2. `docker exec investment-monitor python3 -c 'from models import init_db; init_db()'`")
+            lines.append("3. 必要时 `docker restart investment-monitor`")
+            _send("🚨 监控持续异常 — 需要人工介入", "\n".join(lines), 'red')
+            return
+
+    # 2) DLQ 重放：每 2 小时把历史失败的消息再发一次
+    result = replay_dlq(max_items=10, max_age_hours=48)
+    if result.get('succeeded'):
+        print(f"  DLQ 重放成功 {result['succeeded']}/{result['replayed']} 条")
+
+    # 3) 心跳
     update_heartbeat()
 
 
@@ -81,19 +175,25 @@ def start():
     init_db()
     update_heartbeat()
 
+    # 启动时立即重放一次 DLQ（捕获上次崩溃期间未送达的消息）
+    print("\n  >>> 启动时重放 DLQ ...")
+    try:
+        replay_dlq(max_items=20, max_age_hours=48)
+    except Exception as e:
+        print(f"  DLQ 重放失败（不致命）: {e}")
+
     scheduler = BlockingScheduler(timezone=tz)
 
     # ── 交易时段价格监控（A/H/US 覆盖）──
-    # A股：工作日 9:30–15:00，每 2 小时一次（不是每分钟）
     scheduler.add_job(
-        job_market_monitor,
+        lambda: _wrap('market_monitor', job_market_monitor),
         CronTrigger(day_of_week='mon-fri', hour='9,11,14', minute='35', timezone=tz),
         id='market_monitor',
         name='交易时段监控',
     )
     # 美股收盘（北京时间 05:00）：只捕获美股异常
     scheduler.add_job(
-        job_market_monitor,
+        lambda: _wrap('us_close_monitor', job_market_monitor),
         CronTrigger(day_of_week='tue-sat', hour='5', minute='0', timezone=tz),
         id='us_close_monitor',
         name='美股收盘检测',
@@ -101,7 +201,7 @@ def start():
 
     # ── 每日早晨新闻扫描（9:00）──
     scheduler.add_job(
-        job_daily_news,
+        lambda: _wrap('daily_news', job_daily_news),
         CronTrigger(hour='9', minute='0', timezone=tz),
         id='daily_news',
         name='每日新闻公告',
@@ -109,7 +209,7 @@ def start():
 
     # ── 每周日 20:00 周报 ──
     scheduler.add_job(
-        job_weekly_digest,
+        lambda: _wrap('weekly_digest', job_weekly_digest),
         CronTrigger(day_of_week='sun', hour='20', minute='0', timezone=tz),
         id='weekly_digest',
         name='每周摘要',
@@ -117,27 +217,38 @@ def start():
 
     # ── 数据源健康检查（每 6 小时，2026-06-09 新增）──
     scheduler.add_job(
-        job_data_source_health,
+        lambda: _wrap('data_source_health', job_data_source_health),
         CronTrigger(hour='*/6', minute='0', timezone=tz),
         id='data_source_health',
         name='数据源健康检查',
     )
 
+    # ── 看门狗（每 2 小时，2026-06-11 新增）──
+    scheduler.add_job(
+        lambda: _wrap('watchdog', job_watchdog),
+        CronTrigger(hour='*/2', minute='15', timezone=tz),
+        id='watchdog',
+        name='看门狗',
+    )
+
     print("=" * 55)
-    print("  投资监控系统启动（纪律优先版）")
+    print("  投资监控系统启动（纪律优先版 + 三层防御）")
     print("=" * 55)
     print("\n  调度配置：")
     print("  · 交易时段监控：工作日 9:35 / 11:35 / 14:35")
     print("  · 美股收盘检测：Tue-Sat 05:00")
     print("  · 每日新闻公告：每天 09:00")
     print("  · 每周摘要报告：每周日 20:00")
+    print("  · 数据源健康检查：每 6 小时")
+    print("  · 看门狗：每 2 小时")
     print("\n  EXIT_PENDING 持仓（海尔智家、福耀玻璃）已从监控中剔除")
-    print("  监控原则：信息主动找你，你不主动找信息\n")
+    print("  监控原则：信息主动找你，你不主动找信息")
+    print("  防御层级：L1 单 symbol 隔离 / L2 job 外层兜底 / L3 跨轮看门狗\n")
 
     # 启动时执行一次初始化
     print("  >>> 启动时执行一次初始化监控...")
-    monitor_stocks()
-    check_earnings_calendar()
+    _wrap('init_monitor', job_market_monitor)
+    _wrap('init_news', job_daily_news)
 
     print("\n  开始定时调度...")
     scheduler.start()

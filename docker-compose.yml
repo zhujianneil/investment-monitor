@@ -3,6 +3,7 @@ version: '3.3'
 services:
   app:
     build: ./app
+    image: investment-monitor:defense
     container_name: investment-monitor
     restart: always
     volumes:
@@ -10,5 +11,6 @@ services:
       - ./reports:/app/reports
     environment:
       - TZ=Asia/Shanghai
+      - PYTHONUNBUFFERED=1
     env_file:
       - .env

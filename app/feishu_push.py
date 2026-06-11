@@ -3,11 +3,185 @@ feishu_push.py — 飞书消息推送
 
 按警报类型提供不同的消息模板，每种模板都内嵌了"下一步行动"提示，
 避免收到消息之后不知道该做什么。
+
+可靠性加固（v2）：
+  - 单通道指数退避重试（最多 FEISHU_MAX_RETRIES 次）
+  - 主通道失败时切到 FEISHU_WEBHOOK_BACKUP（failover）
+  - 所有通道都失败时把卡片序列化追加到 data/feishu_dlq.jsonl（DLQ）
+  - 5xx / 网络异常 / 超时 才重试；4xx（参数错）直接 DLQ 不重试
 """
-import requests
+import os
 import json
+import time
 from datetime import datetime
-from config import FEISHU_WEBHOOK
+import requests
+from config import (
+    FEISHU_WEBHOOK,
+    FEISHU_WEBHOOK_BACKUP,
+    FEISHU_MAX_RETRIES,
+    FEISHU_RETRY_BACKOFF,
+    FEISHU_DLQ_PATH,
+)
+
+
+# 飞书 webhook 通用错误码：0 = 成功；非 0 = 业务失败
+# 业务失败通常是卡片格式错或签名错，重试无意义，直接进 DLQ
+_RETRYABLE_HTTP = {500, 502, 503, 504, 429}
+
+
+def _post_once(webhook, card, timeout=10):
+    """单次 POST。返回 (ok: bool, status_code: int|None, payload: dict|str)。"""
+    try:
+        r = requests.post(
+            webhook,
+            headers={'Content-Type': 'application/json'},
+            data=json.dumps(card),
+            timeout=timeout,
+        )
+    except requests.RequestException as e:
+        return False, None, f"network: {e!r}"
+
+    # 飞书 webhook 业务响应是 JSON
+    try:
+        body = r.json()
+    except ValueError:
+        body = r.text
+
+    if r.status_code in _RETRYABLE_HTTP:
+        return False, r.status_code, body
+
+    success = r.ok and (isinstance(body, dict) and (body.get('StatusCode') == 0 or body.get('code') == 0))
+    return success, r.status_code, body
+
+
+def _send_with_retry(webhook, card, label):
+    """对一个通道做指数退避重试。返回 True = 成功。"""
+    if not webhook:
+        return False
+    for attempt in range(1, FEISHU_MAX_RETRIES + 1):
+        ok, status, body = _post_once(webhook, card)
+        if ok:
+            return True
+        # 4xx / 业务错：不重试
+        if status is not None and 400 <= status < 500 and status not in _RETRYABLE_HTTP:
+            print(f"  [飞书] ✗ {label} HTTP {status}（不重试）: {body}")
+            return False
+        if status is None:
+            print(f"  [飞书] ✗ {label} 第 {attempt}/{FEISHU_MAX_RETRIES} 次 {body}")
+        else:
+            print(f"  [飞书] ✗ {label} 第 {attempt}/{FEISHU_MAX_RETRIES} 次 HTTP {status}: {body}")
+        if attempt < FEISHU_MAX_RETRIES:
+            time.sleep(FEISHU_RETRY_BACKOFF * (2 ** (attempt - 1)))
+    return False
+
+
+def _write_dlq(title, content, color, last_error):
+    """所有通道都失败 → 落本地 JSONL（事后人工/脚本重放）。"""
+    try:
+        os.makedirs(os.path.dirname(FEISHU_DLQ_PATH), exist_ok=True)
+        record = {
+            "ts": datetime.now().isoformat(timespec='seconds'),
+            "title": title,
+            "content": content,
+            "color": color,
+            "last_error": str(last_error)[:500],
+        }
+        with open(FEISHU_DLQ_PATH, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(record, ensure_ascii=False) + '\n')
+        print(f"  [飞书] ⚠ 已写入 DLQ: {FEISHU_DLQ_PATH}")
+    except Exception as e:
+        # DLQ 自身失败只能喊出来
+        print(f"  [飞书] ✗✗ DLQ 写入失败（消息丢失）: {e}")
+
+
+def replay_dlq(max_items=20, max_age_hours=48):
+    """
+    DLQ 重放（2026-06-11 新增）。
+    启动时 / 周期性调用，尝试把历史失败的消息再发一遍。
+    超过 max_age_hours 的丢弃；max_items 防止一次性推送轰炸。
+    返回: dict {replayed, succeeded, dropped_old, total_remaining}
+    """
+    from datetime import timedelta
+    if not os.path.exists(FEISHU_DLQ_PATH):
+        return {"replayed": 0, "succeeded": 0, "dropped_old": 0, "total_remaining": 0}
+
+    cutoff = datetime.now() - timedelta(hours=max_age_hours)
+    succeeded = 0
+    dropped_old = 0
+    replayed = 0
+    remaining_lines = []
+
+    try:
+        with open(FEISHU_DLQ_PATH, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+    except Exception as e:
+        print(f"  [DLQ 重放] 读文件失败: {e}")
+        return {"replayed": 0, "succeeded": 0, "dropped_old": 0, "total_remaining": 0}
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+            ts = datetime.fromisoformat(rec.get('ts', ''))
+        except Exception:
+            # 损坏的记录直接丢弃
+            continue
+
+        if ts < cutoff:
+            dropped_old += 1
+            continue
+
+        if replayed >= max_items:
+            # 超过本次预算，剩下的下次重放
+            remaining_lines.append(line)
+            continue
+
+        # 重新构造 card 推送
+        card = {
+            "msg_type": "interactive",
+            "card": {
+                "header": {
+                    "title": {"tag": "plain_text", "content": rec['title']},
+                    "template": rec.get('color', 'blue'),
+                },
+                "elements": [
+                    {"tag": "markdown", "content": rec['content']},
+                    {"tag": "note", "elements": [
+                        {"tag": "plain_text",
+                         "content": f"🔁 DLQ 重放 · 原失败 {rec.get('ts', '?')}"}
+                    ]},
+                ],
+            },
+        }
+        replayed += 1
+        if (_send_with_retry(FEISHU_WEBHOOK, card, "DLQ重放主")
+                or (FEISHU_WEBHOOK_BACKUP and _send_with_retry(FEISHU_WEBHOOK_BACKUP, card, "DLQ重放备"))):
+            succeeded += 1
+        else:
+            # 还失败，保留回队列
+            remaining_lines.append(line)
+
+    # 写回剩余队列
+    try:
+        if remaining_lines:
+            with open(FEISHU_DLQ_PATH, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(remaining_lines) + '\n')
+        else:
+            os.remove(FEISHU_DLQ_PATH)
+    except Exception as e:
+        print(f"  [DLQ 重放] 写回失败: {e}")
+
+    if replayed:
+        print(f"  [DLQ 重放] 尝试 {replayed} 条，成功 {succeeded} 条；剩余 {len(remaining_lines)} 条，过期丢弃 {dropped_old} 条")
+
+    return {
+        "replayed": replayed,
+        "succeeded": succeeded,
+        "dropped_old": dropped_old,
+        "total_remaining": len(remaining_lines),
+    }
 
 
 def _send(title, content, color='blue'):
@@ -31,23 +205,20 @@ def _send(title, content, color='blue'):
             ],
         },
     }
-    try:
-        r = requests.post(
-            FEISHU_WEBHOOK,
-            headers={'Content-Type': 'application/json'},
-            data=json.dumps(card),
-            timeout=10,
-        )
-        result = r.json()
-        if result.get('StatusCode') == 0 or result.get('code') == 0:
-            print(f"  [飞书] ✓ 推送成功: {title}")
-            return True
-        else:
-            print(f"  [飞书] ✗ 推送失败: {result}")
-            return False
-    except Exception as e:
-        print(f"  [飞书] ✗ 推送异常: {e}")
-        return False
+
+    # 主通道
+    if _send_with_retry(FEISHU_WEBHOOK, card, "主通道"):
+        print(f"  [飞书] ✓ 推送成功: {title}")
+        return True
+
+    # Failover：备份通道
+    if FEISHU_WEBHOOK_BACKUP and _send_with_retry(FEISHU_WEBHOOK_BACKUP, card, "备份通道"):
+        print(f"  [飞书] ✓ 备份通道推送成功: {title}")
+        return True
+
+    # 全军覆没 → DLQ
+    _write_dlq(title, content, color, "主+备通道均失败")
+    return False
 
 
 # ── FCF 阈值触发 ──────────────────────────────────────────
