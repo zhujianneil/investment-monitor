@@ -3,11 +3,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 FEISHU_WEBHOOK = os.getenv('FEISHU_WEBHOOK')
+FEISHU_WEBHOOK_BACKUP = os.getenv('FEISHU_WEBHOOK_BACKUP')  # 可选：failover 第二通道
+
+# 推送可靠性配置
+FEISHU_MAX_RETRIES = int(os.getenv('FEISHU_MAX_RETRIES', '3'))
+FEISHU_RETRY_BACKOFF = float(os.getenv('FEISHU_RETRY_BACKOFF', '0.5'))  # 秒，指数退避基数
 
 # 获取项目根目录 (investment-monitor/)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(BASE_DIR, 'data', 'investment.db')
 REPORTS_PATH = os.path.join(BASE_DIR, 'reports')
+FEISHU_DLQ_PATH = os.path.join(BASE_DIR, 'data', 'feishu_dlq.jsonl')
 
 os.makedirs(os.path.join(BASE_DIR, 'data'), exist_ok=True)
 os.makedirs(REPORTS_PATH, exist_ok=True)
@@ -170,11 +176,13 @@ PORTFOLIO = {
     '600690': {
         'name': '海尔智家',
         'market': 'CN',
+        'akshare_symbol': '600690',
         'monitor_type': 'EXIT_PENDING',
     },
     '600660': {
         'name': '福耀玻璃',
         'market': 'CN',
+        'akshare_symbol': '600660',
         'monitor_type': 'EXIT_PENDING',
     },
 }

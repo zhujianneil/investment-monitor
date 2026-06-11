@@ -309,11 +309,10 @@ def monitor_stocks():
     fcf_count = 0
 
     # ── 优化：先批量收集所有 A 股代码，一次 HTTP 请求拿全部行情（2026-06-09 新增）──
+    # 2026-06-11 改动：EXIT_PENDING 持仓（海尔/福耀）也参与异常波动监测，所以纳入 batch
     cn_codes_to_fetch = []
     cn_code_to_symbol = {}  # akshare_code → 投资组合 symbol（600036 是 symbol 也是 akshare_code，映射是恒等）
     for symbol, cfg in PORTFOLIO.items():
-        if cfg['monitor_type'] == 'EXIT_PENDING':
-            continue
         if cfg['market'] == 'CN':
             code = cfg.get('akshare_symbol', symbol)
             cn_codes_to_fetch.append(code)
@@ -328,9 +327,9 @@ def monitor_stocks():
     for symbol, cfg in PORTFOLIO.items():
         name = cfg['name']
 
-        # EXIT_PENDING：完全跳过
-        if cfg['monitor_type'] == 'EXIT_PENDING':
-            continue
+        # EXIT_PENDING：2026-06-11 改为参与异常波动检测（用户要求"所有股票都告诉"）
+        # FCF/估值逻辑继续跳过（退出项不参与估值）
+        is_exit_pending = cfg['monitor_type'] == 'EXIT_PENDING'
 
         # ── 1. 获取当前价格 ──
         if cfg['market'] == 'CN':
@@ -354,14 +353,21 @@ def monitor_stocks():
         print(f"  {name}({symbol}): {price:.2f}  {direction}{abs(change_pct)*100:.2f}%", end="")
 
         # ── 2. 异常波动检测（被动提示，不是交易信号）──
-        threshold = cfg.get('anomaly_threshold', 0.05)
+        # 2026-06-11：用户要求"所有股票波动 > 3.5% 都要告警"
+        threshold = 0.035  # 强制 3.5%，覆盖个股 anomaly_threshold
         if abs(change_pct) >= threshold:
             if not get_last_alert_time(symbol, 'anomaly', hours=8):
-                msg = f"单日波动 {change_pct*100:+.2f}%，建议查看是否有相关新闻，但无需立即行动"
+                exit_tag = " [退出项]" if is_exit_pending else ""
+                msg = f"单日波动 {change_pct*100:+.2f}%（≥3.5%）{exit_tag}，建议查看是否有相关新闻，但无需立即行动"
                 send_anomaly_alert(name, symbol, price, change_pct)
                 save_alert(symbol, 'ANOMALY', msg)
                 print(f"  ⚡ 异常波动", end="")
                 anomaly_count += 1
+
+        # ── FCF 估值逻辑：退出项跳过 ──
+        if is_exit_pending:
+            print()
+            continue
 
         # ── 3. FCF 倍数阈值检测（VALUE_WATCHER 专用）──
         if cfg['monitor_type'] == 'VALUE_WATCHER':
