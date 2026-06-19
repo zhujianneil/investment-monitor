@@ -33,35 +33,37 @@ def get_cn_announcements(akshare_symbol, name, keywords):
     获取 A 股公告, 按 symbol 过滤 + 关键词过滤.
     keywords 为空表示捕获所有公告 (通常只对 EVENT_DRIVEN 生效).
 
-    2026-06-19 修复:
-      - 原: ak.stock_notice_report(symbol=股票代码) → KeyError (symbol 是报告类型)
-      - 现: 拉"重大事项"全市场公告, 客户端按 akshare_symbol 过滤
+    2026-06-19 P1 重构: 废弃 akshare.stock_notice_report (东财接口列名已变, KeyError '代码')
+    改用 cninfo_stream (巨潮官方源) 的当日公告数据
     """
     results = []
     try:
-        # 拉"重大事项"类全市场公告 (与 announcement_stream 同一来源)
         from datetime import datetime as _dt
-        today = _dt.now().strftime('%Y%m%d')
-        df = ak.stock_notice_report(symbol='重大事项', date=today)
-        if df is None or df.empty:
+        today_str = _dt.now().strftime('%Y-%m-%d')
+        # 调 cninfo_stream 的 fetch (POST 巨潮, 一次拿到全市场 SSE+Szse 60 条)
+        from cninfo_stream import fetch_cninfo_announcements
+        items = fetch_cninfo_announcements(date_str=today_str, hard_timeout=20)
+        if not items:
             return results
 
-        # 列名兼容 (东财接口返回: 代码/名称/公告标题/公告类型/公告日期/网址)
-        for _, row in df.iterrows():
-            code  = str(row.get('代码', '')).strip()
-            title = str(row.get('公告标题', '')).strip()
-            url   = str(row.get('网址', '')).strip()
-            pub   = str(row.get('公告日期', _dt.now().date()))
+        target_code = str(akshare_symbol).strip()
+        for ev in items:
+            code  = str(ev.get('code', '')).strip()
+            title = str(ev.get('title', '')).strip()
+            url   = str(ev.get('url', '')).strip()
+            pub   = ev.get('pub_date', today_str)
 
-            # 按 symbol 过滤 (持仓代码 600941 vs 东财代码 600941)
-            if code != str(akshare_symbol).strip():
+            if code != target_code:
                 continue
+            if keywords:
+                if not any(kw in title for kw in keywords):
+                    continue
 
-            # 关键词过滤
-            if keywords and not any(kw in title for kw in keywords):
-                continue
-
-            results.append({'title': title, 'url': url, 'pub_date': pub})
+            results.append({
+                'title': title,
+                'url':   url,
+                'pub':   pub,
+            })
     except Exception as e:
         print(f"  [公告] 获取 {name}({akshare_symbol}) 失败: {e}")
     return results
@@ -224,28 +226,28 @@ def _process_one_news(symbol, cfg, total_new_ref, market_cache=None):
 
 def get_cn_announcements_cached(akshare_symbol, name, keywords, cache: dict):
     """
-    2026-06-19 P0 优化版 get_cn_announcements: 跨持仓复用同一次"重大事项"全市场抓取.
+    2026-06-19 P1 重构: 废弃 akshare.stock_notice_report (列名已变), 改用 cninfo_stream
     cache: {'rows': [...], 'fetched': bool, 'date': str}
     """
     results = []
     try:
         from datetime import datetime as _dt
-        today = _dt.now().strftime('%Y%m%d')
-        # 第一次调用或跨日, 重新拉
+        today = _dt.now().strftime('%Y-%m-%d')
+        # 第一次调用或跨日, 重新拉 (走巨潮官方源, 一次拿 60 条全市场)
         if not cache.get('fetched') or cache.get('date') != today:
-            df = ak.stock_notice_report(symbol='重大事项', date=today)
+            from cninfo_stream import fetch_cninfo_announcements
+            items = fetch_cninfo_announcements(date_str=today, hard_timeout=20)
             cache['rows'] = []
-            if df is not None and not df.empty:
-                for _, r in df.iterrows():
-                    cache['rows'].append({
-                        'code':  str(r.get('代码', '')).strip(),
-                        'title': str(r.get('公告标题', '')).strip(),
-                        'url':   str(r.get('网址', '')).strip(),
-                        'pub':   str(r.get('公告日期', _dt.now().date())),
-                    })
+            for ev in (items or []):
+                cache['rows'].append({
+                    'code':  str(ev.get('code', '')).strip(),
+                    'title': str(ev.get('title', '')).strip(),
+                    'url':   str(ev.get('url', '')).strip(),
+                    'pub':   ev.get('pub_date', today),
+                })
             cache['fetched'] = True
             cache['date'] = today
-            print(f"    [legacy] 已抓 {len(cache['rows'])} 条全市场公告 (复用)")
+            print(f"    [legacy] 已抓 {len(cache['rows'])} 条全市场公告 (巨潮, 复用)")
 
         # 按 symbol + 关键词过滤
         target_code = str(akshare_symbol).strip()

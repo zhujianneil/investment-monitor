@@ -21,7 +21,13 @@ from feishu_push import send_keyword_news_alert
 
 
 def fetch_yf_news_for_symbol(yf_symbol: str, max_age_days: int = 7) -> List[Dict]:
-    """单 ticker 拉 yfinance 新闻, 返回 [{title, url, pub_date, source_id}, ...]"""
+    """单 ticker 拉 yfinance 新闻, 返回 [{title, url, pub_date, source_id}, ...]
+
+    2026-06-19 P1 修复: yfinance 升级后字段结构变了
+      老: title / link / providerPublishTime (顶层)
+      新: content.title / content.canonicalUrl.url / content.pubDate (嵌套)
+    双轨兼容: 优先新结构, 老字段 fallback
+    """
     try:
         ticker = yf.Ticker(yf_symbol)
         news = ticker.news or []
@@ -34,24 +40,54 @@ def fetch_yf_news_for_symbol(yf_symbol: str, max_age_days: int = 7) -> List[Dict
     results = []
     for item in news[:20]:
         try:
-            title = (item.get('title') or '').strip()
-            url   = (item.get('link')  or '').strip()
-            ts    = item.get('providerPublishTime') or 0
+            # ── 字段双轨提取 (P1 修复) ──
+            # 新结构 (yfinance >= 0.2.40)
+            content = item.get('content') or {}
+            if content:
+                title = (content.get('title') or '').strip()
+                # URL: canonicalUrl.url → clickThroughUrl.url → 顶层 link
+                canonical = (content.get('canonicalUrl') or {}).get('url')
+                click_thru = (content.get('clickThroughUrl') or {}).get('url')
+                top_link = item.get('link', '')
+                if canonical:
+                    url = canonical
+                elif click_thru:
+                    url = click_thru
+                else:
+                    url = top_link
+                # pubDate: ISO 8601 字符串
+                pub_str_iso = content.get('pubDate') or content.get('displayTime')
+                if pub_str_iso:
+                    try:
+                        pub_dt = datetime.fromisoformat(pub_str_iso.replace('Z', '+00:00')).replace(tzinfo=None)
+                    except Exception:
+                        pub_dt = None
+                else:
+                    pub_dt = None
+            else:
+                # 老结构 (yfinance < 0.2.40)
+                title = (item.get('title') or '').strip()
+                url = (item.get('link') or '').strip()
+                ts = item.get('providerPublishTime') or 0
+                pub_dt = datetime.fromtimestamp(ts) if ts else None
 
             if not title:
                 continue
 
-            if ts:
-                pub_dt = datetime.fromtimestamp(ts)
+            if pub_dt:
+                # 去掉时区信息, 统一 naive
+                if pub_dt.tzinfo:
+                    pub_dt = pub_dt.replace(tzinfo=None)
                 if pub_dt < cutoff:
                     continue
                 pub_str = pub_dt.strftime('%Y-%m-%d %H:%M:%S')
             else:
-                pub_dt = None
                 pub_str = None
 
-            # yfinance 给的 source_id 字段 (uuid)
-            sid = item.get('uuid') or item.get('id') or f"yf_{yf_symbol}_{ts}"
+            # yfinance source_id 字段
+            sid = (
+                content.get('id') if content else None
+            ) or item.get('id') or item.get('uuid') or f"yf_{yf_symbol}_{pub_str or 'nots'}"
 
             results.append({
                 'title':     title,

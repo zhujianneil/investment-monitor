@@ -27,6 +27,8 @@ from cls_stream import run_cls_stream
 from llm_enhancer import enhance_pending_events, is_available as llm_available
 from earnings_calendar import check_earnings_calendar
 from weekly_digest import send_weekly_report
+from cninfo_stream import run_cninfo_stream
+from sina_global_stream import run_sina_global_stream
 from models import (
     init_db, update_heartbeat, get_recent_source_failures,
     record_monitor_run, get_recent_monitor_runs,
@@ -136,6 +138,25 @@ def job_cls_stream():
     """
     print("\n>>> [7×24 电报] 新浪财经")
     return run_cls_stream()
+
+
+def job_cninfo_stream():
+    """
+    巨潮公告流 (2026-06-19 P1 新增) — 公告流备源
+    每 15 分钟拉一次 (错开东财流的 :00/:15/:30/:45),
+    抓今日全市场公告, 持仓命中推送.
+    """
+    print("\n>>> [巨潮] A 股公告备源")
+    return run_cninfo_stream()
+
+
+def job_sina_global_stream():
+    """
+    新浪全球财经 (2026-06-19 P1 新增) — 港美股新闻备源
+    每小时一次 (lid=1686 国际财经), 失败时 yfinance 兜底
+    """
+    print("\n>>> [新浪全球] 港美股新闻备源")
+    return run_sina_global_stream()
 
 
 def job_llm_enhance():
@@ -322,6 +343,25 @@ def start():
         CronTrigger(minute='5,20,35,50', timezone=tz),
         id='cls_stream',
         name='7×24 电报流',
+    )
+
+    # ── 巨潮公告流 (2026-06-19 P1 新增, 公告流备源) ──
+    # 与东财 announcement_stream 并行, 主源失败时巨潮兜底
+    # 时分错开: 跑在 :10/:25/:40/:55, 避开其他流
+    scheduler.add_job(
+        lambda: _wrap('cninfo_stream', job_cninfo_stream),
+        CronTrigger(minute='10,25,40,55', timezone=tz),
+        id='cninfo_stream',
+        name='巨潮公告流 (备)',
+    )
+
+    # ── 新浪全球财经 (2026-06-19 P1 新增, 港美股新闻备) ──
+    # 每小时一次 (lid=1686 国际财经), 失败降级 yfinance
+    scheduler.add_job(
+        lambda: _wrap('sina_global_stream', job_sina_global_stream),
+        CronTrigger(minute='15', timezone=tz),
+        id='sina_global_stream',
+        name='新浪全球财经 (港美股备)',
     )
 
     # ── LLM 增强 (2026-06-19 新增) ──
