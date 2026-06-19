@@ -90,8 +90,13 @@ def job_market_monitor():
 
 
 def job_daily_news():
-    """每日早晨：新闻公告扫描 + 财报日历"""
-    print("\n>>> [每日] 新闻公告扫描")
+    """
+    每日 9:00 早晨: news_monitor 关键词扫描 + 财报日历.
+    注: 2026-06-19 后, A 股公告 + 7x24 电报 + 港美股 yf 新闻
+    已被 announcement_stream/cls_stream/yf_news_stream 接管 (15min/60min).
+    本 job 保留: 1) news_monitor 的 announcements 表历史镜像 2) 财报日历检查
+    """
+    print("\n>>> [每日 9:00] 关键词新闻 (legacy) + 财报日历")
     monitor_news()
     check_earnings_calendar()
 
