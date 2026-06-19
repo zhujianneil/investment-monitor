@@ -263,17 +263,76 @@ def send_anomaly_alert(name, symbol, price, change_pct):
 
 # ── 关键词新闻 ────────────────────────────────────────────
 
-def send_keyword_news_alert(name, symbol, title, url, keywords):
-    """EVENT_DRIVEN 持仓的关键词新闻命中"""
+def _classify_relevance(name: str, title: str, keywords: list) -> str:
+    """
+    2026-06-19 P0 修复: 区分"主体相关"vs"只是关键词出现"
+    返回 'primary' (新闻主体就是该公司) | 'thematic' (主题相关但不是标的专属) | 'weak' (弱相关)
+    规则: title 含公司名/简称/股票代码 → primary; 只命中主题词 → thematic
+    """
+    # 1) 公司名直接出现 (强主体)
+    name_short = name.replace('集团', '').replace('控股', '').replace('股份', '')
+    if name and len(name) >= 2 and name in title:
+        return 'primary'
+    if name_short and len(name_short) >= 2 and name_short in title:
+        return 'primary'
+
+    # 2) 关键词里有股票代码 / 简称
+    # (关键词列表通常第一项是公司名)
+    if keywords:
+        first_kw = str(keywords[0])
+        if first_kw and len(first_kw) >= 2 and first_kw in title:
+            return 'primary'
+
+    # 3) 只有主题词命中 (如 5G/算力 是行业概念, 非标的专属)
+    if keywords:
+        theme_hits = [k for k in keywords[1:] if k in title]  # 跳过第一个(公司名)
+        if theme_hits:
+            return 'thematic'
+
+    return 'weak'
+
+
+def send_keyword_news_alert(name, symbol, title, url, keywords, relevance: str = None):
+    """
+    EVENT_DRIVEN 持仓的关键词新闻命中
+    relevance: 'primary' (主体相关) | 'thematic' (主题相关) | 'weak' (弱相关)
+              None 时自动用 _classify_relevance 判断
+    """
     matched = [kw for kw in keywords if kw.lower() in title.lower()]
+    if relevance is None:
+        relevance = _classify_relevance(name, title, keywords)
+
+    # 标签 + 颜色: primary 红色 (主信号) | thematic 橙色 (行业信号) | weak 灰色
+    if relevance == 'primary':
+        tag = '🔴 主体相关'
+        color = 'red'
+        header_emoji = '🎯'
+    elif relevance == 'thematic':
+        tag = '🟡 主题相关'
+        color = 'orange'
+        header_emoji = '📡'
+    else:
+        tag = '⚪ 弱相关'
+        color = 'grey'
+        header_emoji = 'ℹ️'
+
+    # 给主题相关/弱相关一个提示, 避免误判
+    if relevance == 'primary':
+        hint = "**信号强度**：🔴 高 — 新闻主体就是该公司，建议立即阅读。"
+    elif relevance == 'thematic':
+        hint = ("**信号强度**：🟡 中 — 命中行业主题词，**非标的专属**。\n"
+                "请判断是否真影响该公司（例如「5G」可能是行业新闻也可能是中国移动具体动作）。")
+    else:
+        hint = "**信号强度**：⚪ 低 — 弱相关，可能误报。"
+
     content = (
-        f"**{name}** ({symbol})\n"
-        f"📰 {title}\n"
-        f"关键词命中：`{'` `'.join(matched)}`\n\n"
+        f"**{name}** ({symbol}) {tag}\n"
+        f"{header_emoji} {title}\n"
+        f"关键词命中：`{'` `'.join(matched) or '(无)'}`\n\n"
         f"[查看原文]({url})\n\n"
-        f"---\n**提示**：这是事件驱动型监控的核心信号，建议仔细阅读。"
+        f"---\n{hint}"
     )
-    return _send(f"📢 关键新闻 — {name}", content, 'orange')
+    return _send(f"{header_emoji} 关键新闻 — {name}", content, color)
 
 
 # ── 公告提醒 ──────────────────────────────────────────────

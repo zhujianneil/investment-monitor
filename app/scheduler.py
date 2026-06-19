@@ -21,11 +21,16 @@ import pytz
 
 from stock_monitor import monitor_stocks
 from news_monitor import monitor_news
+from announcement_stream import run_announcement_stream
+from yf_news_stream import run_yf_news_stream
+from cls_stream import run_cls_stream
+from llm_enhancer import enhance_pending_events, is_available as llm_available
 from earnings_calendar import check_earnings_calendar
 from weekly_digest import send_weekly_report
 from models import (
     init_db, update_heartbeat, get_recent_source_failures,
     record_monitor_run, get_recent_monitor_runs,
+    get_db,
 )
 from data_sources import health_check as ds_health_check
 from feishu_push import _send, replay_dlq
@@ -89,6 +94,55 @@ def job_daily_news():
     print("\n>>> [每日] 新闻公告扫描")
     monitor_news()
     check_earnings_calendar()
+
+
+def job_announcement_stream():
+    """
+    A 股公告流（2026-06-19 新增）— 第一层, 无 LLM 依赖
+    每 15 分钟跑一次, 只抓"重大事项"类 (快, 30s 内).
+    """
+    print("\n>>> [公告流] A 股全市场重大事项")
+    return run_announcement_stream(report_types=['重大事项'])
+
+
+def job_announcement_stream_full():
+    """
+    A 股公告流 (全量) — 跑全报告类型, 1 小时一次.
+    补齐 15min 跑漏的类型 (资产重组/风险提示/财务报告).
+    """
+    print("\n>>> [公告流] A 股全市场全量")
+    return run_announcement_stream(report_types=['重大事项', '资产重组', '风险提示', '财务报告'])
+
+
+def job_yf_news_stream():
+    """
+    港美股 yfinance 新闻流 (2026-06-19 新增) — 第一层
+    每小时一次, 关键词命中推送.
+    """
+    print("\n>>> [港美股新闻] yfinance 抓取")
+    return run_yf_news_stream()
+
+
+def job_cls_stream():
+    """
+    7×24 电报流 (2026-06-19 P1 新增) — 第一层
+    新浪财经 7×24 公开 API (lid=2515 科技/AI, 2509/2516 国际财经, 2514 国际时政)
+    每 15 分钟一次, 关键词命中推送.
+    """
+    print("\n>>> [7×24 电报] 新浪财经")
+    return run_cls_stream()
+
+
+def job_llm_enhance():
+    """
+    LLM 增强 (2026-06-19 新增) — 第二层
+    每 15 分钟扫一次未增强的 events (LLM key 未配时降级跳过).
+    """
+    if not llm_available():
+        print("\n>>> [LLM 增强] 未配置, 跳过")
+        return {'disabled': True}
+    print("\n>>> [LLM 增强] 处理未增强 events")
+    return enhance_pending_events(batch_size=20)
 
 
 def job_weekly_digest():
@@ -162,6 +216,31 @@ def job_watchdog():
             _send("🚨 监控持续异常 — 需要人工介入", "\n".join(lines), 'red')
             return
 
+    # 1.5) 东财公告流连续失败检测 (2026-06-19 P0)
+    # 逻辑: 最近 2 小时 stock_notice_report_* 失败 >= 5 次 → 东财接口可能挂了
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('''SELECT COUNT(*) as cnt FROM data_source_failures
+                     WHERE source_name LIKE 'stock_notice_report_%'
+                     AND occurred_at > datetime('now', '-2 hours')''')
+        em_fail_cnt = c.fetchone()['cnt']
+        conn.close()
+        if em_fail_cnt >= 5:
+            lines = ["**🚨 东财公告接口疑似挂了**\n"]
+            lines.append(f"最近 2 小时 `stock_notice_report_*` 失败 **{em_fail_cnt} 次** (阈值 5)\n")
+            lines.append("**可能原因**：")
+            lines.append("- Oracle 服务器到 np-anotice-stock.eastmoney.com 的 SSL 不稳")
+            lines.append("- 东财接口本身限流/维护")
+            lines.append("- 容器内 Python requests 库版本过老\n")
+            lines.append("**下一步**：")
+            lines.append("1. `docker exec investment-monitor python3 -c 'import requests; r=requests.get(\"https://np-anotice-stock.eastmoney.com/\", timeout=5); print(r.status_code)'`")
+            lines.append("2. 如果一直 SSL EOF → 临时降级, 等东财恢复")
+            lines.append("3. 考虑加备用源 (巨潮 cninfo)")
+            _send("🚨 东财公告接口持续失败", "\n".join(lines), 'red')
+    except Exception as e:
+        print(f"  [watchdog] 东财检测异常 (不致命): {e}")
+
     # 2) DLQ 重放：每 2 小时把历史失败的消息再发一次
     result = replay_dlq(max_items=10, max_age_hours=48)
     if result.get('succeeded'):
@@ -207,6 +286,48 @@ def start():
         name='每日新闻公告',
     )
 
+    # ── A 股公告流 (2026-06-19 新增) ──
+    # 15min 跑一次快版 (只抓'重大事项')
+    scheduler.add_job(
+        lambda: _wrap('announcement_stream', job_announcement_stream),
+        CronTrigger(minute='*/15', timezone=tz),
+        id='announcement_stream',
+        name='A 股公告流 (快版)',
+    )
+    # 60min 跑一次全量 (补齐其他报告类型)
+    scheduler.add_job(
+        lambda: _wrap('announcement_stream_full', job_announcement_stream_full),
+        CronTrigger(minute='30', timezone=tz),
+        id='announcement_stream_full',
+        name='A 股公告流 (全量)',
+    )
+
+    # ── 港美股 yfinance 新闻流 (2026-06-19 新增) ──
+    scheduler.add_job(
+        lambda: _wrap('yf_news_stream', job_yf_news_stream),
+        CronTrigger(minute='45', timezone=tz),
+        id='yf_news_stream',
+        name='港美股 yf 新闻流',
+    )
+
+    # ── 7×24 电报流 (2026-06-19 P1 新增) ──
+    # 时分错开 announcement_stream (公告流 */15 跑在 0/15/30/45 分的 :00)
+    scheduler.add_job(
+        lambda: _wrap('cls_stream', job_cls_stream),
+        CronTrigger(minute='5,20,35,50', timezone=tz),
+        id='cls_stream',
+        name='7×24 电报流',
+    )
+
+    # ── LLM 增强 (2026-06-19 新增) ──
+    # 15min 一次, key 未配时降级跳过
+    scheduler.add_job(
+        lambda: _wrap('llm_enhance', job_llm_enhance),
+        CronTrigger(minute='7,22,37,52', timezone=tz),
+        id='llm_enhance',
+        name='LLM 事件增强',
+    )
+
     # ── 每周日 20:00 周报 ──
     scheduler.add_job(
         lambda: _wrap('weekly_digest', job_weekly_digest),
@@ -245,10 +366,13 @@ def start():
     print("  监控原则：信息主动找你，你不主动找信息")
     print("  防御层级：L1 单 symbol 隔离 / L2 job 外层兜底 / L3 跨轮看门狗\n")
 
-    # 启动时执行一次初始化
+    # 启动时执行一次初始化监控
     print("  >>> 启动时执行一次初始化监控...")
     _wrap('init_monitor', job_market_monitor)
     _wrap('init_news', job_daily_news)
+    _wrap('init_announcement_stream', job_announcement_stream)  # 2026-06-19 立即跑一次抓当日
+    _wrap('init_yf_news', job_yf_news_stream)  # 2026-06-19 立即跑一次抓港美股
+    _wrap('init_cls_stream', job_cls_stream)  # 2026-06-19 P1 立即跑一次 7×24
 
     print("\n  开始定时调度...")
     scheduler.start()

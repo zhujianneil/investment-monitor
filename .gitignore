@@ -1,1 +1,9 @@
-.env echo __pycache__/ echo *.pyc echo data/ echo reports/
+.env
+__pycache__/
+*.pyc
+data/
+reports/
+logs/
+.venv/
+*.db-journal
+.DS_Store

@@ -102,6 +102,51 @@ def init_db():
     )
     ''')
 
+    # ── 事件流表（2026-06-19 新增）────────────────────────────
+    # 实时流，区别于 announcements 的"历史镜像"。
+    # events 存 cn_announcement / cls_telegraph / yf_news / google_news 四类源。
+    # symbol 可空（宏观/板块新闻）。
+    # UNIQUE 约束基于 source+source_id（外部 ID）或 source+title+pub_date（无外部 ID 时）
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL,            -- 'cn_announcement' | 'cls_telegraph' | 'yf_news' | 'google_news'
+        source_id TEXT,                   -- 外部源 ID（去重锚点）
+        symbol TEXT,                      -- 关联标的；空 = 宏观/板块
+        title TEXT NOT NULL,
+        content TEXT,                     -- 公告正文 / 新闻摘要
+        url TEXT,
+        pub_date TIMESTAMP,               -- 发布时间 (精度见 pub_date_precision)
+        pub_date_precision TEXT DEFAULT 'day',  -- 'day' | 'datetime' (2026-06-19 P0)
+        fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        relevance TEXT DEFAULT NULL,      -- 'primary' | 'thematic' | 'weak' | NULL (2026-06-19 P0)
+        llm_summary TEXT,                 -- LLM 一句话解读
+        llm_sentiment REAL,               -- -1 ~ 1
+        llm_themes TEXT,                  -- JSON array string
+        llm_severity TEXT,                -- 'high' | 'medium' | 'low'
+        llm_cached_at TIMESTAMP,          -- 增强完成时间
+        pushed INTEGER DEFAULT 0,         -- 是否已推飞书
+        UNIQUE(source, source_id, pub_date)
+    )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_events_symbol ON events(symbol)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_events_pub ON events(pub_date)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_events_pushed ON events(pushed, llm_severity)')
+
+    # ── LLM 增强缓存表（2026-06-19 新增）─────────────────────
+    # 按 title hash 缓存增强结果，同一标题只调一次 LLM。
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS llm_cache (
+        title_hash TEXT PRIMARY KEY,      -- sha1(title)[:16]
+        title TEXT NOT NULL,
+        summary TEXT,
+        sentiment REAL,
+        themes TEXT,                      -- JSON
+        severity TEXT,
+        cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+
     conn.commit()
     conn.close()
     print("数据库初始化完成")
