@@ -78,6 +78,17 @@ PORTFOLIO = {
         'earnings_months': [3, 8],
     },
 
+    '600018': {
+        'name': '上港集团',
+        'market': 'CN',
+        'akshare_symbol': '600018',
+        'monitor_type': 'VALUE_WATCHER',
+        'fcf': {'buy': None, 'sell': None},  # 港口类, 关注 PB/吞吐量
+        'anomaly_threshold': 0.05,
+        'news_keywords': ['上港集团', '港口', '集装箱吞吐量', '上海港', '关税'],
+        'earnings_months': [3, 8],
+    },
+
     # ── 2. EVENT_DRIVEN (事件/政策驱动型) ────────────────────────
     
     'V': {
@@ -191,6 +202,12 @@ PORTFOLIO = {
         'name': '福耀玻璃',
         'market': 'CN',
         'akshare_symbol': '600660',
+        'monitor_type': 'EXIT_PENDING',
+    },
+    '3606.HK': {
+        'name': '福耀玻璃 H',
+        'market': 'HK',
+        'yf_symbol': '3606.HK',
         'monitor_type': 'EXIT_PENDING',
     },
 }
