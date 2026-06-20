@@ -155,6 +155,9 @@ def run_sina_global_stream(dry_run: bool = False, push: bool = True) -> Dict:
             else:
                 send_keyword_news_alert(name, sym, ev.get('title', ''),
                                          ev.get('url', ''), keywords)
+                # P1: 推送成功回写 (审计闭环)
+                from announcement_stream import mark_pushed
+                mark_pushed('sina_global', ev.get('source_id', ''), ev.get('pub_date', ''))
             pushed += 1
 
     stats = {

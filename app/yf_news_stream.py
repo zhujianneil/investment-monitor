@@ -126,7 +126,9 @@ def run_yf_news_stream(dry_run: bool = False) -> Dict:
         try:
             items = fetch_yf_news_for_symbol(yf_sym)
             for it in items:
-                # 入库 (去重)
+                # 推送去重 (P1 修复 2026-06-19):
+                # 1) 已存在的 (is_new=False) 直接跳过, 防止刷屏
+                # 2) 推送成功后回写 pushed=1, 审计闭环
                 is_new = save_event(
                     source='yf_news',
                     source_id=it['source_id'] or '',
@@ -134,10 +136,12 @@ def run_yf_news_stream(dry_run: bool = False) -> Dict:
                     title=it['title'],
                     url=it['url'],
                     pub_date=it['pub_date'] or '',
-                    pub_date_precision='datetime',  # yfinance 给的是 publishTime
+                    pub_date_precision='datetime',
                 )
                 if is_new:
                     total_new += 1
+                else:
+                    continue  # 已存在, 跳过推送 (P1 去重)
 
                 # 关键词命中推送 (无关键词的非 EVENT_DRIVEN 不推)
                 if kws and any(kw.lower() in it['title'].lower() for kw in kws):
@@ -145,6 +149,9 @@ def run_yf_news_stream(dry_run: bool = False) -> Dict:
                         print(f"    [DRY-RUN] yf 推 {name}({sym}): {it['title'][:50]}")
                     else:
                         send_keyword_news_alert(name, sym, it['title'], it['url'], kws)
+                        # P1: 推送成功回写
+                        from announcement_stream import mark_pushed
+                        mark_pushed('yf_news', it['source_id'] or '', it['pub_date'] or '')
                     total_pushed += 1
         except Exception as e:
             print(f"  [yf 新闻流] {sym} 整轮异常: {e}")

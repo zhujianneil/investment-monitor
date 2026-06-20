@@ -175,6 +175,9 @@ def run_cls_stream(dry_run: bool = False) -> Dict:
                 print(f"    [DRY-RUN] 推 → {name}({sym}) [{relevance}]: {ev['title'][:50]}")
             else:
                 send_keyword_news_alert(name, sym, ev['title'], ev['url'], keywords, relevance=relevance)
+                # P1: 推送成功回写 (审计闭环)
+                from announcement_stream import mark_pushed
+                mark_pushed('cls_telegraph', ev.get('source_id', '') or '', ev.get('pub_date', '') or '')
             pushed += 1
 
     stats = {

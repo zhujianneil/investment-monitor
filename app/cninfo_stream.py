@@ -206,6 +206,9 @@ def run_cninfo_stream(date_str: Optional[str] = None, dry_run: bool = False,
                     send_keyword_news_alert(name, sym, ev.get('title',''), ev.get('url',''), keywords)
                 else:
                     send_announcement_alert(name, sym, ev.get('title',''), ev.get('url',''))
+                # P1: 推送成功回写 (审计闭环)
+                from announcement_stream import mark_pushed
+                mark_pushed('cn_announcement_cninfo', ev.get('source_id', ''), ev.get('pub_date', ''))
             pushed += 1
 
     stats = {

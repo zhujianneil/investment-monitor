@@ -141,13 +141,14 @@ def _normalize_a_share_symbol(code: str) -> str:
 # ── 入库 ─────────────────────────────────────────────────────
 
 def save_event(source: str, title: str, symbol: Optional[str] = None,
-               content: str = '', url: str = '', pub_date: str = None,
-               source_id: str = None, pub_date_precision: str = 'day',
-               relevance: str = None) -> bool:
+               content: str = '', url: str = '', pub_date: Optional[str] = None,
+               source_id: Optional[str] = None, pub_date_precision: str = 'day',
+               relevance: Optional[str] = None, pushed: int = 0) -> bool:
     """
     入 events 表, 唯一约束 source+source_id+pub_date.
     pub_date_precision: 'day' (东财公告) | 'datetime' (yf/财联社 实时流)
     relevance: 'primary' | 'thematic' | 'weak' | None (2026-06-19 P0)
+    pushed: 0/1 推送标记, 默认 0 (2026-06-19 P1 修复: 审计断裂导致无法去重)
     返回 True=新插入, False=已存在(去重) 或失败.
     """
     try:
@@ -155,16 +156,63 @@ def save_event(source: str, title: str, symbol: Optional[str] = None,
         cursor = conn.cursor()
         cursor.execute('''
             INSERT OR IGNORE INTO events
-              (source, source_id, symbol, title, content, url, pub_date, pub_date_precision, relevance)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+              (source, source_id, symbol, title, content, url, pub_date, pub_date_precision, relevance, pushed)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (source, source_id or '', symbol, title, content, url,
-              pub_date or '', pub_date_precision, relevance))
+              pub_date or '', pub_date_precision, relevance, pushed))
         inserted = cursor.rowcount > 0
         conn.commit()
         conn.close()
         return inserted
     except Exception as e:
         print(f"  [save_event] 失败: {e}")
+        return False
+
+
+def mark_pushed(source: str, source_id: str, pub_date: str) -> None:
+    """
+    推送成功后回写 pushed=1, 解决审计断裂 + 支持推送去重 (P1 修复 2026-06-19)
+    source_id 为空时按 title 兜底匹配
+    """
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        if source_id:
+            cursor.execute('''
+                UPDATE events SET pushed=1
+                WHERE source=? AND source_id=? AND pub_date=?
+            ''', (source, source_id, pub_date or ''))
+        else:
+            cursor.execute('''
+                UPDATE events SET pushed=1
+                WHERE source=? AND title=? AND pub_date=?
+            ''', (source, '', pub_date or ''))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"  [mark_pushed] 失败: {e}")
+
+
+def is_already_pushed(source: str, source_id: str, pub_date: str) -> bool:
+    """
+    检查事件是否已推送 (P1 去重, 2026-06-19)
+    返回 True=已推过, False=未推或 events 表无此条
+    """
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        if source_id:
+            cursor.execute('''
+                SELECT pushed FROM events
+                WHERE source=? AND source_id=? AND pub_date=?
+                LIMIT 1
+            ''', (source, source_id, pub_date or ''))
+        else:
+            return False
+        row = cursor.fetchone()
+        conn.close()
+        return bool(row and row[0])
+    except Exception as e:
         return False
 
 
@@ -260,6 +308,9 @@ def run_announcement_stream(report_types: Optional[List[str]] = None, dry_run: b
                     send_keyword_news_alert(name, sym, ev.get('title',''), ev.get('url',''), keywords)
                 else:
                     send_announcement_alert(name, sym, ev.get('title',''), ev.get('url',''))
+                # P1: 推送成功回写 (审计闭环)
+                from announcement_stream import mark_pushed
+                mark_pushed('cn_announcement', ev.get('source_id') or '', ev.get('pub_date') or '')
             pushed += 1
 
     stats = {
