@@ -60,7 +60,7 @@ RETRY_BACKOFF = [2, 4, 8]  # 第一次失败等 2s, 第二次 4s, 第三次 8s
 # ── 抓取 ─────────────────────────────────────────────────────
 
 def _fetch_cninfo_one_market(column: str, plate: str, date_str: str,
-                              page_size: int = 100, max_pages: int = 3) -> List[Dict]:
+                              page_size: int = 30, max_pages: int = 10) -> List[Dict]:
     """
     拉单个市场单日所有公告.
     date_str: 'YYYY-MM-DD' 格式
