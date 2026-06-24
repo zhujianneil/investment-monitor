@@ -316,12 +316,24 @@ def send_keyword_news_alert(name, symbol, title, url, keywords, relevance: str =
         color = 'grey'
         header_emoji = 'ℹ️'
 
-    # 给主题相关/弱相关一个提示, 避免误判
+    # 2026-06-22 P1 修复: 英文/中文新闻用不同措辞
+    # yf_news 拉美股/港股新闻 title 必是英文, cfg.name 是中文
+    # 之前: "新闻主体就是该公司" 对中文用户是误导 (title 里没有"阿里巴巴"也能 primary)
+    has_cjk = any('\u4e00' <= c <= '\u9fff' for c in title)
+    is_english_news = not has_cjk
+
     if relevance == 'primary':
-        hint = "**信号强度**：🔴 高 — 新闻主体就是该公司，建议立即阅读。"
+        if is_english_news:
+            hint = "**信号强度**：🔴 高 — 该英文新闻主体即本公司（按英文名/代码匹配），建议立即阅读。"
+        else:
+            hint = "**信号强度**：🔴 高 — 新闻主体就是该公司，建议立即阅读。"
     elif relevance == 'thematic':
-        hint = ("**信号强度**：🟡 中 — 命中行业主题词，**非标的专属**。\n"
-                "请判断是否真影响该公司（例如「5G」可能是行业新闻也可能是中国移动具体动作）。")
+        if is_english_news:
+            hint = ("**信号强度**：🟡 中 — 英文新闻命中持仓英文关键词/代码，**非新闻主体**。\n"
+                    "请判断是否真影响该公司。")
+        else:
+            hint = ("**信号强度**：🟡 中 — 命中行业主题词，**非标的专属**。\n"
+                    "请判断是否真影响该公司（例如「5G」可能是行业新闻也可能是中国移动具体动作）。")
     else:
         hint = "**信号强度**：⚪ 低 — 弱相关，可能误报。"
 
@@ -345,6 +357,70 @@ def send_announcement_alert(name, symbol, title, url):
         f"[查看公告]({url})"
     )
     return _send(f"📢 新公告 — {name}", content, 'orange')
+
+
+# ── 龙虎榜异动（2026-06-22 新增）──────────────────────────
+# 广发接口返回的上榜个股清单，由 lhb_stream 调本函数
+def send_lhb_alert(name, symbol, lhb_item: dict, reason_text: str):
+    """
+    龙虎榜异动推送 — 持仓股上榜时告警
+
+    lhb_item: 广发接口返回的标准化字段
+        {trdCode, secuSht, clsPrc, dayChgRat, tnvVol, tnvVal, items[...], date, market}
+    reason_text: 拼接好的上榜原因 (e.g. "涨幅偏离值达 7% / 连续 3 日累计 30%")
+    """
+    chg = lhb_item.get('dayChgRat')
+    chg_str = f"{chg:+.2f}%" if isinstance(chg, (int, float)) else "N/A"
+    cls = lhb_item.get('clsPrc')
+    cls_str = f"{cls:.2f}" if isinstance(cls, (int, float)) else "N/A"
+    tnv_val = lhb_item.get('tnvVal')
+    tnv_str = f"{tnv_val/1e8:.2f} 亿" if isinstance(tnv_val, (int, float)) and tnv_val else "N/A"
+    market = lhb_item.get('market', '?')
+    trd_code = lhb_item.get('trdCode', '?')
+    date_str = str(lhb_item.get('date', ''))
+
+    # 涨跌幅 → 颜色
+    if isinstance(chg, (int, float)):
+        if chg >= 9.5:
+            color = 'red'       # 涨停级
+            tag = '🔴 涨停级异动'
+        elif chg <= -9.5:
+            color = 'red'
+            tag = '🔴 跌停级异动'
+        elif chg > 0:
+            color = 'orange'
+            tag = '🟠 涨幅异动'
+        elif chg < 0:
+            color = 'orange'
+            tag = '🟠 跌幅异动'
+        else:
+            color = 'blue'
+            tag = '🔵 换手/振幅异动'
+    else:
+        color = 'red'
+        tag = '🔴 龙虎榜异动'
+
+    content = (
+        f"**{name}** ({symbol})  {tag}\n"
+        f"📅 交易日：{date_str}  市场：**{market}**\n\n"
+        f"**上榜原因**：{reason_text}\n\n"
+        f"**关键数据**：\n"
+        f"- 收盘价：{cls_str}\n"
+        f"- 日涨跌幅：{chg_str}\n"
+        f"- 成交额：{tnv_str}\n"
+        f"- 交易代码：`{trd_code}`\n\n"
+        f"---\n"
+        f"**信号强度**：🔴 **官方异动阈值** (上交所/深交所定义) — 不是模型拍的 ±5%。\n\n"
+        f"**为什么这条有用**：\n"
+        f"1. 龙虎榜 = 上交所/深交所对涨跌幅/振幅/换手率超阈值的强制披露\n"
+        f"2. 你收到 = 这只股**真的异动**,不是市场情绪波动\n"
+        f"3. 上榜原因比涨跌幅本身更准 (e.g. 「振幅 15%」可能当天没涨没跌,但波动巨大)\n\n"
+        f"**下一步**：\n"
+        f"- 持仓逻辑是否仍然成立？(参考 cfg.fcf / anomaly_threshold)\n"
+        f"- 是否触发止盈/止损线？\n"
+        f"- 龙虎榜详情 (营业部席位) 需广发接口 `lhb_stock_detail`, 本 skill 未集成"
+    )
+    return _send(f"🚨 龙虎榜异动 — 持仓 {name}", content, color)
 
 
 # ── 财报提醒 ──────────────────────────────────────────────

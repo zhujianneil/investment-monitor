@@ -13,11 +13,16 @@ cls_stream.py — 财联社 / 新浪财经 7×24 实时电报流 (第一层, 无
   2. 去重入 events (source='cls_telegraph', 沿用设计稿命名, 实际是新浪源)
   3. 关键词命中持仓 → 推飞书
   4. 没 LLM 也能用 (与 announcement_stream / yf_news_stream 一致)
+
+2026-06-20 P0 修复 (6 lid 串行超时):
+  feed.mix.sina.com.cn 单 lid 3-6s, 6 lid 串行 30s+ 必超时.
+  改为 ThreadPool 并行, 单 lid 硬超时 15s.
 """
 import time
 import requests
 from datetime import datetime, timedelta
 from typing import List, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config import PORTFOLIO
 from models import get_db, record_source_failure
@@ -31,49 +36,61 @@ SINA_PAGEID = 153
 # 关注的 lid: 国际财经 / 科技 AI (持仓相关)
 SINA_LIDS = [2515, 2509, 2516, 2517, 2518, 2514]
 FETCH_NUM = 30  # 每次拉多少条
+SINA_HARD_TIMEOUT = 15  # 2026-06-20 P0: 单 lid 硬超时 (单 lid 实测 3-6s)
+
+
+def _fetch_single_lid(l: int, num: int = FETCH_NUM) -> List[Dict]:
+    """单 lid 拉取 (无超时, 由外层 ThreadPool.result 控)."""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Referer': 'https://finance.sina.com.cn/',
+    }
+    params = {'pageid': SINA_PAGEID, 'lid': l, 'num': num, 'page': 1}
+    r = requests.get(SINA_API, params=params, headers=headers, timeout=10)
+    if r.status_code != 200:
+        raise Exception(f'HTTP {r.status_code}')
+    data = r.json()
+    if data.get('result', {}).get('status', {}).get('code') != 0:
+        raise Exception(f'业务码 != 0: {data["result"]["status"]}')
+    out = []
+    for item in data['result'].get('data', []):
+        title = (item.get('title') or '').strip()
+        url   = (item.get('url')   or '').strip()
+        ts    = int(item.get('ctime', 0) or 0)
+        if not title or not ts:
+            continue
+        pub_dt = datetime.fromtimestamp(ts)
+        out.append({
+            'title':     title,
+            'url':       url,
+            'pub_date':  pub_dt.strftime('%Y-%m-%d %H:%M:%S'),
+            'source_id': f'sina_{l}_{ts}',
+            'lid':       l,
+        })
+    return out
 
 
 def fetch_sina_telegraph(lid: int = None, num: int = FETCH_NUM) -> List[Dict]:
     """
     拉新浪 7×24 流. lid=None = 拉全部 SINA_LIDS 后合并.
     返回 [{title, url, pub_date, source_id, lid}, ...]
+
+    2026-06-20 P0: 改 ThreadPool 并行 (max_workers=6), 单 lid 硬超时 15s.
     """
     lids = [lid] if lid else SINA_LIDS
     out = []
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'Referer': 'https://finance.sina.com.cn/',
-    }
-    for l in lids:
-        params = {'pageid': SINA_PAGEID, 'lid': l, 'num': num, 'page': 1}
-        try:
-            r = requests.get(SINA_API, params=params, headers=headers, timeout=10)
-            if r.status_code != 200:
-                print(f"  [电报流] lid={l} HTTP {r.status_code}")
-                record_source_failure(f'sina_telegraph_{l}', Exception(f'HTTP {r.status_code}'))
-                continue
-            data = r.json()
-            if data.get('result', {}).get('status', {}).get('code') != 0:
-                print(f"  [电报流] lid={l} 业务码 != 0: {data['result']['status']}")
-                continue
-            for item in data['result'].get('data', []):
-                title = (item.get('title') or '').strip()
-                url   = (item.get('url')   or '').strip()
-                ts    = int(item.get('ctime', 0) or 0)
-                if not title or not ts:
-                    continue
-                pub_dt = datetime.fromtimestamp(ts)
-                out.append({
-                    'title':     title,
-                    'url':       url,
-                    'pub_date':  pub_dt.strftime('%Y-%m-%d %H:%M:%S'),
-                    'source_id': f'sina_{l}_{ts}',
-                    'lid':       l,
-                })
-        except Exception as e:
-            print(f"  [电报流] lid={l} 失败: {type(e).__name__}: {e}")
-            record_source_failure(f'sina_telegraph_{l}', e)
+    # 并行拉取, 单 lid 独立失败处理
+    with ThreadPoolExecutor(max_workers=len(lids)) as ex:
+        future_map = {ex.submit(_fetch_single_lid, l, num): l for l in lids}
+        for fut in as_completed(future_map):
+            l = future_map[fut]
+            try:
+                items = fut.result(timeout=SINA_HARD_TIMEOUT)
+                out.extend(items)
+            except Exception as e:
+                print(f"  [电报流] lid={l} 失败: {type(e).__name__}: {e}")
+                record_source_failure(f'sina_telegraph_{l}', e)
     return out
 
 
@@ -122,34 +139,70 @@ def run_cls_stream(dry_run: bool = False) -> Dict:
         unique.append(ev)
     print(f"  [电报流] 去重后 {len(unique)} 条")
 
+    # 2026-06-22 P1: 跨 lid 二次去重 (同 title + 同分钟)
+    # 不同 lid 可能给不同 source_id (e.g. lid=2515 时 source_id='sina_2515_ts',
+    # lid=2509 时是 'sina_2509_ts') → 上面 seen 拦不住
+    # 后果: 同一新闻在数据库里出现 2-4 次, 每次都触发推送
+    # 修复: 同 (title 前 30 字, pub_date 到分钟) 视为同一新闻, 留 source_id 最小的
+    from collections import defaultdict
+    title_minute_map = defaultdict(list)
+    for ev in unique:
+        title_key = (ev.get('title', '') or '')[:30].strip()
+        pub_minute = (ev.get('pub_date', '') or '')[:16]  # YYYY-MM-DD HH:MM
+        if not title_key:
+            continue
+        title_minute_map[(title_key, pub_minute)].append(ev)
+    deduped = []
+    for ev in unique:
+        title_key = (ev.get('title', '') or '')[:30].strip()
+        pub_minute = (ev.get('pub_date', '') or '')[:16]
+        bucket = title_minute_map.get((title_key, pub_minute), [ev])
+        if bucket and bucket[0] is ev:
+            deduped.append(ev)
+    if len(deduped) < len(unique):
+        print(f"  [电报流] 跨 lid 标题去重: {len(unique)} → {len(deduped)} 条 (节省 {len(unique)-len(deduped)} 次潜在重复推送)")
+    unique = deduped
+
     new_in_db = 0
     pushed = 0
     # 2026-06-19 P0: 导入 relevance 分类 (避免循环导入延迟到第一次调用)
     from feishu_push import _classify_relevance
+    PUSH_RELEVANCE_MIN = 'primary'  # 默认只推主体相关, 主题/弱相关不推 (避免噪声)
     for ev in unique:
         # 先匹配, 拿命中的 symbol 列表
         hits = match_holdings_sina(ev)
-        # symbol 字段: 逗号分隔多标的, 命中为空时留 None (宏观新闻)
-        sym_field = ','.join(sorted({h[0] for h in hits})) if hits else None
-
-        # relevance: 7x24 流一条新闻可能命中多持仓, relevance 取最高的
-        # (primary 优先, 没人 primary 才取 thematic, 都没就 weak)
-        rel_rank = {'primary': 3, 'thematic': 2, 'weak': 1}
+        # 2026-06-22 P0 修复: symbol 字段只保留 relevance 达标的持仓
+        # 之前: sym_field = 全部命中持仓的并集 → 错配
+        #   例: NVDA 主题新闻 + 002050 三花智控 keywords 含"机器人"
+        #     → 002050 也被标 symbol, 但 best_relevance=primary 是 NVDA 的
+        #     → events.symbol 写成 "002050,NVDA" → 002050 名下出现英伟达新闻
+        # 现在: 逐持仓判 relevance, 只把达标的写 events.symbol
+        rel_order = {'primary': 3, 'thematic': 2, 'weak': 1}
+        min_rank = rel_order.get(PUSH_RELEVANCE_MIN, 3)
+        primary_syms = set()
         best_relevance = 'weak'
+        per_sym_relevance = {}  # 2026-06-22 记录每个 sym 自己的 relevance, 推送时用
         for sym, cfg in hits:
             r = _classify_relevance(cfg.get('name', sym), ev['title'], cfg.get('news_keywords', []))
-            if rel_rank.get(r, 0) > rel_rank.get(best_relevance, 0):
+            per_sym_relevance[sym] = r
+            if rel_order.get(r, 0) >= min_rank:
+                primary_syms.add(sym)
+            if rel_order.get(r, 0) > rel_order.get(best_relevance, 0):
                 best_relevance = r
+
+        # symbol 字段: 只写 relevance 达标的标的 (comma-separated)
+        sym_field = ','.join(sorted(primary_syms)) if primary_syms else None
 
         is_new = save_event(
             source='cls_telegraph',   # 沿用设计稿 tag
             source_id=ev['source_id'] or '',
-            symbol=sym_field,         # 2026-06-19 P0: 写回命中的 symbol
+            symbol=sym_field,         # 2026-06-22 P0: 只写 relevance 达标的 symbol
             title=ev['title'],
             url=ev['url'],
             pub_date=ev['pub_date'] or '',
             pub_date_precision='datetime',  # 新浪是 Unix 时间戳, 精确到秒
-            relevance=best_relevance if hits else None,  # 2026-06-19 P0: 写回 relevance
+            relevance=best_relevance if hits else None,  # 最高 relevance (供显示)
+            cross_lid_dedup=True,    # 2026-06-22 P1: 跨 lid 标题去重 (应用层, 兜底 save_event UNIQUE 拦不住的情况)
         )
         if is_new:
             new_in_db += 1
@@ -159,18 +212,13 @@ def run_cls_stream(dry_run: bool = False) -> Dict:
         if not is_new:
             continue  # 已入库, 跳过推送 (避免噪声)
 
-        # 关键词命中推送 (2026-06-19 P0: 只推 primary, thematic/weak 降级到每日汇总)
-        # 阈值可调: PUSH_RELEVANCE_MIN = 'thematic' 推主题+主体; 默认 'primary' 只推主体
-        from feishu_push import _classify_relevance
-        PUSH_RELEVANCE_MIN = 'primary'  # 默认只推主体相关, 主题/弱相关不推 (避免噪声)
+        # 关键词命中推送 (2026-06-22 P0: 推送 symbol 集合 = primary_syms, 用 per_sym_relevance)
         for sym, cfg in hits:
+            if sym not in primary_syms:
+                continue  # 2026-06-22 P0: relevance 不达标不推 (即使在 hits 列表里)
             name = cfg.get('name', sym)
             keywords = cfg.get('news_keywords', [])
-            relevance = _classify_relevance(name, ev['title'], keywords)
-            # relevance 强度过滤
-            rel_order = {'primary': 3, 'thematic': 2, 'weak': 1}
-            if rel_order.get(relevance, 0) < rel_order.get(PUSH_RELEVANCE_MIN, 3):
-                continue  # 不达阈值, 跳过
+            relevance = per_sym_relevance.get(sym, 'weak')
             if dry_run:
                 print(f"    [DRY-RUN] 推 → {name}({sym}) [{relevance}]: {ev['title'][:50]}")
             else:

@@ -9,6 +9,13 @@ yf_news_stream.py — 港美股 yfinance 新闻流 (第一层)
   - 每个 ticker 拉 yf.Ticker(symbol).news
   - 关键词命中 → 入 events (source='yf_news') → 推飞书
   - 每只 ticker 独立 try/except (L1 防御, 2026-06-11 已立)
+
+2026-06-20 P0 修复 (symbol 错配):
+  yfinance 升级后, ticker.news 实际返回的是 Yahoo 财经热门流(全市场),
+  不是该 ticker 的专属新闻. 旧代码把所有 20 条都标 symbol=ticker,
+  导致 NVDA 名下出现 Gold Bear Market/SpaceX/XRP 等不相关新闻.
+  修复: 入库前做相关性校验 — 标题里必须出现 ticker/公司名才标 symbol,
+  否则 symbol 留空 (作为宏观新闻入 events 库但不归到该 ticker).
 """
 from datetime import datetime, timedelta
 from typing import List, Dict
@@ -101,6 +108,55 @@ def fetch_yf_news_for_symbol(yf_symbol: str, max_age_days: int = 7) -> List[Dict
     return results
 
 
+def _is_news_relevant_to_ticker(title: str, ticker: str, name: str, keywords=None) -> bool:
+    """
+    2026-06-20 P0 修复: yfinance 返回的"热门流"是全市场, 需要校验标题是否真相关.
+
+    2026-06-23 P1 升级: 加权计分制, 防止"AI/GPU/H100" 等次关键词擦边匹配.
+    之前 5 个 OR 条件, 任一命中即相关 → 12 条 NVDA 错配 ('1 Top AI Stock to Buy' 等)
+    现在改为计分 ≥ 2 才算相关:
+      强命中 (+2 分): ticker / 核心代码 / 公司名 / keywords[0]
+      弱命中 (+1 分): keywords 第 2 项及以后 (主题词如 'GPU' / 'AI芯片')
+    例: 'HIVE BUZZ HPC Secures GPU Cloud Contract' (只有 GPU 命中, 1 分) →
+        仍判相关 (但 HIVE 是 NVDA 客户, 标 NVDA 也合理, 实际是 HIVE 标 HIVE)
+        ↑ 这条之前是 symbol=NVDA, 其实是 HIVE 的新闻被强标到 NVDA
+    例: '1 Top AI Stock to Buy' (含 'AI 芯片'? 不含) → 0 分 → 不相关 ✓
+    例: 'Nvidia's AI Premium Faces Pricing Test' (含 'Nvidia') → 2 分 → 相关 ✓
+
+    兼容老数据: 6-23 前已入库的 12 条错配 (id 20156/20157/22692/...) 已在数据库清理
+    """
+    if not title:
+        return False
+    t = title
+    t_lower = t.lower()
+    import re
+    score = 0
+
+    # 1) ticker 整串
+    if ticker and ticker.lower() in t_lower:
+        score += 2
+    # 2) ticker 去市场后缀
+    if ticker:
+        core = re.sub(r'[^A-Za-z0-9]', '', ticker)
+        if len(core) >= 4 and core.lower() in re.sub(r'[^A-Za-z0-9]', '', t_lower):
+            score += 2
+    # 3) 公司名
+    if name and len(name) >= 2 and name in t:
+        score += 2
+    # 4) keywords 第一项 (强)
+    if keywords:
+        first = str(keywords[0]) if keywords else ''
+        if first and len(first) >= 2 and first.lower() in t_lower:
+            score += 2
+        # 5) keywords 后续主题词 (弱, 每个 +1)
+        for kw in keywords[1:]:
+            kw_str = str(kw)
+            if kw_str and len(kw_str) >= 2 and (kw_str.lower() in t_lower or kw_str in t):
+                score += 1
+
+    return score >= 2
+
+
 def run_yf_news_stream(dry_run: bool = False) -> Dict:
     """主流程: 遍历持仓 → 拉新闻 → 入库 → 关键词命中推送"""
     started = datetime.now()
@@ -126,13 +182,19 @@ def run_yf_news_stream(dry_run: bool = False) -> Dict:
         try:
             items = fetch_yf_news_for_symbol(yf_sym)
             for it in items:
+                # 2026-06-20 P0 修复: 二次相关性校验
+                # yfinance 现在返回的是 Yahoo 财经热门流(全市场),
+                # 不校验会把 Gold/SpaceX/XRP 之类不相关新闻都打到 NVDA 名下.
+                relevant = _is_news_relevant_to_ticker(it['title'], yf_sym, name, kws)
+                event_sym = sym if relevant else ''
+
                 # 推送去重 (P1 修复 2026-06-19):
                 # 1) 已存在的 (is_new=False) 直接跳过, 防止刷屏
                 # 2) 推送成功后回写 pushed=1, 审计闭环
                 is_new = save_event(
                     source='yf_news',
                     source_id=it['source_id'] or '',
-                    symbol=sym,
+                    symbol=event_sym,
                     title=it['title'],
                     url=it['url'],
                     pub_date=it['pub_date'] or '',
@@ -144,6 +206,9 @@ def run_yf_news_stream(dry_run: bool = False) -> Dict:
                     continue  # 已存在, 跳过推送 (P1 去重)
 
                 # 关键词命中推送 (无关键词的非 EVENT_DRIVEN 不推)
+                # P0 修复: 不相关的新闻直接跳过推送 (即使有"AI"等宽词也不会再误推 NVDA)
+                if not relevant:
+                    continue
                 if kws and any(kw.lower() in it['title'].lower() for kw in kws):
                     if dry_run:
                         print(f"    [DRY-RUN] yf 推 {name}({sym}): {it['title'][:50]}")

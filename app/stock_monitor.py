@@ -444,18 +444,21 @@ def _process_one_stock(symbol, cfg, cn_quotes_cache):
                     fcf_count += 1
 
             elif sell_t and fcf_mult >= sell_t:
-                if not get_last_alert_time(symbol, 'FCF_SELL', hours=24):
-                    if skip_push:
-                        # 数据陈旧或极端倍数 → 只记录，不推送飞书
-                        reason = "数据陈旧" if is_stale else f"倍数极端(>{EXTREME_MULTIPLE}x)"
-                        msg = f"⚠️ FCF {fcf_mult:.1f}x 触发卖出线 {sell_t}x，但因{reason}（报告期 {fcf_data.get('report_period')}，滞后 {lag} 天），仅记录不推送"
-                        save_alert(symbol, 'FCF_SELL_STALE', msg)
-                        print(f"  🔇 卖出信号[抑制推送：{reason}]", end="")
-                    else:
-                        msg = f"FCF {fcf_mult:.1f}x ≥ 卖出线 {sell_t}x → 执行减仓/清仓清单"
-                        send_fcf_threshold_alert(name, symbol, 'sell', fcf_mult, price, sell_t)
-                        save_alert(symbol, 'FCF_SELL', msg)
-                        fcf_count += 1
+                if skip_push:
+                    # 2026-06-22 P0 修复: 数据陈旧或极端倍数时完全静默
+                    # 之前: save_alert 写 FCF_SELL_STALE 到 alerts 表
+                    #   1. 任何读 alerts 表的展示/推送逻辑会再次发出 (刷屏)
+                    #   2. get_last_alert_time 查的是 FCF_SELL 不是 FCF_SELL_STALE
+                    #      → 去重键错配, 每次重启都触发
+                    #   3. message 里写"仅记录不推送"是误导 — 实际 alerts 表就有
+                    # 现在: 完全不写, print 一行让 operator 知道 (但不进任何表)
+                    reason = "数据陈旧" if is_stale else f"倍数极端(>{EXTREME_MULTIPLE}x)"
+                    print(f"  🔇 卖出信号[完全静默：{reason}, report_period={fcf_data.get('report_period')}, lag={lag}天]", end="")
+                elif not get_last_alert_time(symbol, 'FCF_SELL', hours=24):
+                    msg = f"FCF {fcf_mult:.1f}x ≥ 卖出线 {sell_t}x → 执行减仓/清仓清单"
+                    send_fcf_threshold_alert(name, symbol, 'sell', fcf_mult, price, sell_t)
+                    save_alert(symbol, 'FCF_SELL', msg)
+                    fcf_count += 1
         elif market == 'CN':
             # A股但拿不到数据（akshare 接口失败）
             print(f"  [FCF 数据缺失]", end="")

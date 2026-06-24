@@ -9,6 +9,8 @@ sina_global_stream.py — 港美股新闻备源 (新浪财经国际财经 2509 +
   - 通过 PORTFOLIO ticker + 名称关键词命中 → 入 events
 
 调度: 每小时一次, 错开 yf_news_stream (yf 跑在 :45)
+
+2026-06-20 P0 修复: 改 ThreadPool 并行拉 2 lid, 避免单 lid 超时拖垮整轮.
 """
 import sqlite3
 import time
@@ -116,30 +118,54 @@ def match_holdings_global(item: Dict) -> List[tuple]:
 def run_sina_global_stream(dry_run: bool = False, push: bool = True) -> Dict:
     """
     一轮新浪全球财经流: 拉 2509 + 2514 → 入 events → 持仓命中推送
+    2026-06-20 P0: 两 lid 并行拉取, 避免串行超时.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     started = datetime.now()
     print(f"\n{'='*55}")
     print(f"  新浪全球财经 — {started.strftime('%Y-%m-%d %H:%M')}")
     print(f"{'='*55}")
 
+    # 2026-06-20 P0: 两 lid 并行, 避免单 lid 慢拖垮整轮
     all_items = []
-    for lid, desc in SINA_GLOBAL_LIDS:
-        items = fetch_sina_global_lid(lid, desc)
-        print(f"    [sina_global] lid={lid} ({desc}): {len(items)} 条")
-        all_items.extend(items)
+    with ThreadPoolExecutor(max_workers=len(SINA_GLOBAL_LIDS)) as ex:
+        future_map = {ex.submit(fetch_sina_global_lid, lid, desc): (lid, desc)
+                      for lid, desc in SINA_GLOBAL_LIDS}
+        for fut in as_completed(future_map):
+            lid, desc = future_map[fut]
+            try:
+                items = fut.result(timeout=25)
+                print(f"    [sina_global] lid={lid} ({desc}): {len(items)} 条")
+                all_items.extend(items)
+            except Exception as e:
+                print(f"    [sina_global] lid={lid} ({desc}) 失败: {type(e).__name__}: {e}")
     print(f"  [sina_global] 抓取 {len(all_items)} 条")
 
     new_in_db = 0
     pushed = 0
+    from feishu_push import _classify_relevance
     for ev in all_items:
+        # 2026-06-20 P0: 提前匹配, 把命中的 symbol 写回 events.symbol
+        # 跟 cls_stream 一致 — 之前 sina_global 全部 symbol=空, 没法按 symbol 查
+        hits_pre = match_holdings_global(ev)
+        sym_field = ','.join(sorted({h[0] for h in hits_pre})) if hits_pre else ''
+        # relevance: 取最高
+        rel_rank = {'primary': 3, 'thematic': 2, 'weak': 1}
+        best_relevance = 'weak'
+        for sym, cfg in hits_pre:
+            r = _classify_relevance(cfg.get('name', sym), ev['title'], cfg.get('news_keywords', []))
+            if rel_rank.get(r, 0) > rel_rank.get(best_relevance, 0):
+                best_relevance = r
+
         is_new = save_event(
             source='sina_global',
             source_id=ev.get('source_id', ''),
-            symbol='',  # 国际财经无明确标的
+            symbol=sym_field,
             title=ev.get('title', ''),
             url=ev.get('url', ''),
             pub_date=ev.get('pub_date', ''),
             pub_date_precision='datetime',
+            relevance=best_relevance if hits_pre else None,
         )
         if is_new:
             new_in_db += 1
@@ -147,14 +173,23 @@ def run_sina_global_stream(dry_run: bool = False, push: bool = True) -> Dict:
             continue
 
         hits = match_holdings_global(ev)
+        # 2026-06-20 P0: relevance 过滤, 跟 cls_stream 一致 — 只推主体相关,
+        # 避免"印度空军坠机"含"印度"二字被推到小米集团这种 thematic 误报.
+        # 注: yfinance 错配问题已通过二次校验修, sina_global 标题含 ticker/公司名
+        # 即 primary, 仅主题词命中 (如"印度") 是 thematic — 不推.
+        PUSH_RELEVANCE_MIN = 'primary'
         for sym, cfg in hits:
             name = cfg.get('name', sym)
             keywords = cfg.get('news_keywords', [])
+            relevance = _classify_relevance(name, ev['title'], keywords)
+            rel_order = {'primary': 3, 'thematic': 2, 'weak': 1}
+            if rel_order.get(relevance, 0) < rel_order.get(PUSH_RELEVANCE_MIN, 3):
+                continue  # thematic/weak 不推
             if dry_run:
-                print(f"    [DRY-RUN] 推 → {name}({sym}): {ev.get('title','')[:50]}")
+                print(f"    [DRY-RUN] 推 → {name}({sym}) [{relevance}]: {ev.get('title','')[:50]}")
             else:
                 send_keyword_news_alert(name, sym, ev.get('title', ''),
-                                         ev.get('url', ''), keywords)
+                                         ev.get('url', ''), keywords, relevance=relevance)
                 # P1: 推送成功回写 (审计闭环)
                 from announcement_stream import mark_pushed
                 mark_pushed('sina_global', ev.get('source_id', ''), ev.get('pub_date', ''))

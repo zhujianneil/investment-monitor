@@ -41,7 +41,8 @@ PORTFOLIO = {
         'monitor_type': 'VALUE_WATCHER',
         'fcf': {'buy': 15, 'covered_call': 25, 'sell': 30},
         'anomaly_threshold': 0.05,
-        'news_keywords': ['腾讯', '游戏版号', '监管', 'AI投入', '微信', '视频号'],
+        # 2026-06-20 P0: 加 Tencent 英文名, Yahoo 英文新闻流相关校验靠它
+        'news_keywords': ['腾讯', 'Tencent', '游戏版号', '监管', 'AI投入', '微信', '视频号'],
         'earnings_months': [3, 5, 8, 11],
     },
     
@@ -63,7 +64,8 @@ PORTFOLIO = {
         'monitor_type': 'VALUE_WATCHER',
         'fcf': {'buy': 20, 'sell': 35},
         'anomaly_threshold': 0.07,
-        'news_keywords': ['泡泡玛特', '盲盒', '出海', 'IP', '王宁'],
+        # 2026-06-20 P0: 加 Pop Mart 英文名
+        'news_keywords': ['泡泡玛特', 'Pop Mart', '盲盒', '出海', 'IP', '王宁'],
         'earnings_months': [3, 8],
     },
 
@@ -74,7 +76,9 @@ PORTFOLIO = {
         'monitor_type': 'VALUE_WATCHER',
         'fcf': {'buy': None, 'sell': None}, # 银行看 PB/ROE，这里设为观察
         'anomaly_threshold': 0.05,
-        'news_keywords': ['招商银行', '不良率', '净息差', '分红', '零售银行'],
+        # 2026-06-21 注释: '分红' 是行业泛词 (2026-06-20 P0 bug: 银河微电分红公告错配到招行)
+        # match_holdings 修复后已要求 cfg.name 出现在 title 才推, 此词暂保留作主题信号但不再触发误推
+        'news_keywords': ['招商银行', '不良率', '净息差', '零售银行'],
         'earnings_months': [3, 8],
     },
 
@@ -97,7 +101,7 @@ PORTFOLIO = {
         'yf_symbol': 'V',
         'monitor_type': 'EVENT_DRIVEN',
         'anomaly_threshold': 0.05,
-        'news_keywords': ['Visa', 'DOJ', 'antitrust', 'stablecoin', 'cross-border payment'],
+        'news_keywords': ['Visa', 'VISA', 'DOJ', 'antitrust', 'stablecoin', 'cross-border payment'],
         'earnings_months': [1, 4, 7, 10],
     },
 
@@ -117,7 +121,7 @@ PORTFOLIO = {
         'yf_symbol': 'BRK-B',
         'monitor_type': 'EVENT_DRIVEN',
         'anomaly_threshold': 0.08,
-        'news_keywords': ['Berkshire', 'Buffett', '巴菲特', 'annual letter'],
+        'news_keywords': ['Berkshire', '伯克希尔', 'Buffett', '巴菲特', 'annual letter', 'BRK.B', 'BRK-B'],
         'earnings_months': [2, 8],
     },
     
@@ -140,7 +144,8 @@ PORTFOLIO = {
         'monitor_type': 'EARNINGS_WAIT',
         'fcf': {'sell': 22, 'hard_sell': 25},
         'anomaly_threshold': 0.06,
-        'news_keywords': ['小米', '汽车交付', 'SU7', '印度'],
+        # 2026-06-20 P0: 加 Xiaomi 英文名
+        'news_keywords': ['小米', 'Xiaomi', '汽车交付', 'SU7', '印度'],
         'earnings_months': [3, 5, 8, 11],
     },
 
@@ -150,7 +155,11 @@ PORTFOLIO = {
         'yf_symbol': 'NVDA',
         'monitor_type': 'EARNINGS_WAIT',
         'anomaly_threshold': 0.08,
-        'news_keywords': ['NVIDIA', 'AI', 'H100', 'B200', 'GPU', '黄仁勋'],
+        # 2026-06-20 P0 修复: 去掉 'AI' 关键词 — 几乎所有美股新闻都含 "AI",
+        # 导致 yfinance 全市场热门流里 SpaceX/Gold/XRP 等都被错推到 NVDA.
+        # 2026-06-23 P1: 加 Jensen/Huang (黄仁勋英文名), 加 HIVE/H200/GTC 行业词
+        'news_keywords': ['NVIDIA', 'Nvidia', '英伟达', '黄仁勋', 'Jensen', 'Huang',
+                          'H100', 'B200', 'B100', 'H200', 'Blackwell', 'Hopper', 'GPU', 'GTC'],
         'earnings_months': [2, 5, 8, 11],
     },
 
@@ -159,7 +168,8 @@ PORTFOLIO = {
         'market': 'HK',
         'yf_symbol': '9988.HK',
         'monitor_type': 'EARNINGS_WAIT',
-        'news_keywords': ['阿里巴巴', '阿里云', '淘天', '马云', '吴泳铭'],
+        # 2026-06-20 P0: 加 Alibaba / BABA 英文名
+        'news_keywords': ['阿里巴巴', 'Alibaba', 'BABA', '阿里云', '淘天', '马云', '吴泳铭'],
         'earnings_months': [2, 5, 8, 11],
     },
 
@@ -168,7 +178,9 @@ PORTFOLIO = {
         'market': 'CN',
         'akshare_symbol': '002156',
         'monitor_type': 'EARNINGS_WAIT',
-        'news_keywords': ['通富微电', '封装', '半导体', '芯片', 'AMD'],
+        # 2026-06-21 注释: '半导体'/'芯片' 是行业泛词, 任何同业公告都会被错配 (同招行 bug)
+        # match_holdings 修复后已要求 cfg.name 出现在 title 才推, 此词暂保留作主题信号但不再触发误推
+        'news_keywords': ['通富微电', '封装', 'AMD'],
         'earnings_months': [3, 8],
     },
 
@@ -230,3 +242,44 @@ ALL_NEWS_KEYWORDS = {
     s: {'name': c['name'], 'keywords': c.get('news_keywords', [])}
     for s, c in PORTFOLIO.items() if c['monitor_type'] != 'EXIT_PENDING'
 }
+
+
+# ============================================================
+# AH 溢价信号系统 (2026-06-22 新增)
+# ============================================================
+
+# AH 双重上市大盘股样本 (A 代码, 名称, H 代码 yfinance 4 位)
+# 用于自算 AH 溢价指数（备源 / 主源）
+# 选取标准：AH 双重上市 + 流通市值大 + yfinance 双边都有行情
+# 注: H 代码必须是 yfinance 能查到的 4 位数（部分老代码 yfinance 没收，换成近似大股）
+AH_DUAL_LISTED = [
+    ("600036", "招商银行",     "3968"),     # ✓ 招行
+    ("601398", "工商银行",     "1398"),     # ✓ 工行
+    ("601318", "中国平安",     "2318"),     # ✓ 平安
+    ("601988", "中国银行",     "3988"),     # ✓ 中行
+    ("601628", "中国人寿",     "2628"),     # ✓ 人寿
+    ("601088", "中国神华",     "1088"),     # ✓ 神华
+    ("601328", "交通银行",     "3328"),     # ✓ 交行
+    ("600027", "华电国际",     "1071"),     # ✓ 华电
+    ("601898", "中煤能源",     "1898"),     # ✓ 中煤
+    ("601939", "建设银行",     "939"),      # ✓ 建行
+]  # fetcher 会按列名对齐 — yfinance 不支持的代码由 fetcher 静默 skip
+
+# AH 溢价信号阈值（动态分位计算所需基础）
+AH_PREMIUM_QUANTILE_HIGH = 0.80     # > 80分位为高位
+AH_PREMIUM_QUANTILE_STRONG = 0.90   # > 90分位为强高位
+AH_PREMIUM_QUANTILE_LOW = 0.20      # < 20分位为低位
+
+# 南向资金阈值（动态倍数基准窗口）
+SOUTHBOUND_WINDOW_DAYS = 30          # 30日均值基准
+SOUTHBOUND_FACTOR_HIGH = 1.5         # > 1.5× 30日均值 = 高流入
+SOUTHBOUND_FACTOR_OUTFLOW = -0.5     # < -0.5× 30日均值 = 净流出加速
+
+# USDHKD 弱方保证（v1.2：制度常量 + 分位双轨）
+USDHKD_WEAK_FLOOR = 7.83             # 制度阈值（弱方保证 7.85 前 0.02 触发）
+USDHKD_RECOVER = 7.80               # 从弱方回稳到 < 7.80
+USDHKD_QUANTILE_WEAK = 0.95         # 1 年分位 ≥ 95% 也算弱方压力
+
+# 收敛/分化 5日变化率阈值
+AH_DELTA_CONVERGE = -2.0             # 5日Δ < -2% → 收敛加速
+AH_DELTA_DIVERGE = 3.0               # 5日Δ > +3% → 分化加速

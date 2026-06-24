@@ -70,11 +70,19 @@ def fetch_announcements(report_type: str = '重大事项', date: Optional[str] =
 def _fetch_announcements_inner(report_type: str, date: str, max_records: int) -> List[Dict]:
     """实际抓取逻辑 (由 fetch_announcements 包硬超时)"""
     # 东财接口 SSL 不稳, 加重试 (2026-06-19 加固)
+    # 2026-06-20 优化: KeyError '代码' 是 akshare 上游 bug (stock_notice.py:118
+    # 当数据没准备好时 '代码' 列缺失), 重试无用, 立即放弃
     last_err = None
     for attempt in range(3):
         try:
             df = ak.stock_notice_report(symbol=report_type, date=date)
             break
+        except KeyError as e:
+            # akshare 上游 bug, 重试不会成功
+            last_err = e
+            print(f"  [公告流] {report_type} @ {date} akshare 上游 KeyError {e} (数据未就绪?), 立即放弃")
+            record_source_failure(f'stock_notice_report_{report_type}', e)
+            return []
         except Exception as e:
             last_err = e
             wait = 2 ** attempt
@@ -85,11 +93,15 @@ def _fetch_announcements_inner(report_type: str, date: str, max_records: int) ->
         record_source_failure(f'stock_notice_report_{report_type}', last_err)
         return []
 
+    # 列名校验 (2026-06-20 加固): 缺列直接跳过整批, 避免 row.get KeyError
+    # 注: 东财 公告日期 字段只到日 (YYYY-MM-DD), 没有时分. 尊重数据源精度.
     if df is None or df.empty:
         return []
-
-    # 列名确认 (返回固定: 代码/名称/公告标题/公告类型/公告日期/网址)
-    # 注: 东财 公告日期 字段只到日 (YYYY-MM-DD), 没有时分. 尊重数据源精度.
+    expected_cols = {'代码', '名称', '公告标题', '网址', '公告日期', '公告类型'}
+    if not expected_cols.issubset(set(df.columns)):
+        missing = expected_cols - set(df.columns)
+        print(f"  [公告流] {report_type} 列名不符, 缺 {missing}, 实际列: {list(df.columns)}")
+        return []
     results = []
     for _, row in df.head(max_records).iterrows():
         try:
@@ -143,21 +155,39 @@ def _normalize_a_share_symbol(code: str) -> str:
 def save_event(source: str, title: str, symbol: Optional[str] = None,
                content: str = '', url: str = '', pub_date: Optional[str] = None,
                source_id: Optional[str] = None, pub_date_precision: str = 'day',
-               relevance: Optional[str] = None, pushed: int = 0) -> bool:
+               relevance: Optional[str] = None, pushed: int = 0,
+               cross_lid_dedup: bool = False) -> bool:
     """
     入 events 表, 唯一约束 source+source_id+pub_date.
     pub_date_precision: 'day' (东财公告) | 'datetime' (yf/财联社 实时流)
     relevance: 'primary' | 'thematic' | 'weak' | None (2026-06-19 P0)
     pushed: 0/1 推送标记, 默认 0 (2026-06-19 P1 修复: 审计断裂导致无法去重)
+    cross_lid_dedup: True 时额外查 (source, title[:30], pub_date) 是否存在 (2026-06-22 P1)
+                    解决 cls_telegraph 跨 lid 同一新闻 source_id 不同导致的重复入库
     返回 True=新插入, False=已存在(去重) 或失败.
     """
     try:
+        # 2026-06-22 P1: 跨 lid 标题去重 (应用层)
+        # 同 source 不同 source_id 但 title+pub_date 相同 → 视为同一新闻
+        if cross_lid_dedup and title and pub_date:
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT 1 FROM events
+                WHERE source=? AND substr(title,1,30)=? AND pub_date=?
+                LIMIT 1
+            ''', (source, (title or '')[:30], pub_date or ''))
+            if cursor.fetchone():
+                conn.close()
+                return False  # 跨 lid 重复, 跳过
+            conn.close()
+
         conn = get_db()
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT OR IGNORE INTO events
-              (source, source_id, symbol, title, content, url, pub_date, pub_date_precision, relevance, pushed)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT OR IGNORE INTO events
+          (source, source_id, symbol, title, content, url, pub_date, pub_date_precision, relevance, pushed)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (source, source_id or '', symbol, title, content, url,
               pub_date or '', pub_date_precision, relevance, pushed))
         inserted = cursor.rowcount > 0
@@ -216,6 +246,41 @@ def is_already_pushed(source: str, source_id: str, pub_date: str) -> bool:
         return False
 
 
+def is_pushed_duplicate(symbol: str, title: str, pub_date: str,
+                        within_minutes: int = 30) -> bool:
+    """
+    跨源去重 (2026-06-20 新增): 检查 (symbol, title, pub_date) 组合
+    在最近 within_minutes 分钟内是否已被任一 source 推送.
+
+    目的: 东财 (cn_announcement) 和巨潮 (cn_announcement_cninfo) 并行时,
+    同一条公告会两边都入库, 推送会重复.
+    按 (symbol + 标题前 50 字 + 发布日) 模糊匹配: 同标的同日同主题 = 同一公告.
+
+    返回 True=最近已推过, False=没推过 (可推).
+    """
+    try:
+        # 标题截前 50 字: 巨潮/东财对同一公告标题可能有微小差异 (如标点/空格)
+        title_key = (title or '')[:50].strip()
+        if not title_key or not symbol:
+            return False
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT 1 FROM events
+            WHERE pushed=1
+              AND symbol=?
+              AND substr(title, 1, 50)=?
+              AND pub_date=?
+              AND fetched_at > datetime('now', ?)
+            LIMIT 1
+        ''', (symbol, title_key, pub_date or '', f'-{within_minutes} minutes'))
+        row = cursor.fetchone()
+        conn.close()
+        return bool(row)
+    except Exception as e:
+        return False
+
+
 # ── 推送匹配 ─────────────────────────────────────────────────
 
 def match_holdings(event: Dict) -> List[tuple]:
@@ -245,10 +310,15 @@ def match_holdings(event: Dict) -> List[tuple]:
             hits.append((sym, cfg))
             continue
 
-        # 关键词命中
+        # 关键词命中 (2026-06-21 P0 修复: 必须持仓名出现在 title 才推, 否则行业词如「分红」
+        # 会把别家公告推到这家. 例: 银河微电「分红」公告被推到 600036 招商银行)
         kws = cfg.get('news_keywords', [])
         if kws and any(kw in title for kw in kws):
-            hits.append((sym, cfg))
+            # 强约束: 持仓名必须在 title 里 (而非只匹配行业词)
+            holding_name = cfg.get('name', '').strip()
+            if holding_name and holding_name in title:
+                hits.append((sym, cfg))
+            # 否则: 主题相关, 但不直接推 — 由用户决定是否后续接 EVENT_DRIVEN 关键词报警
 
     return hits
 
@@ -277,11 +347,20 @@ def run_announcement_stream(report_types: Optional[List[str]] = None, dry_run: b
 
     new_in_db = 0
     pushed = 0
+    skipped = 0
     for ev in all_raw:
+        # 2026-06-23 P0 修复: 跟 cninfo 一致, 入库前过 match_holdings
+        # 全市场抓的公告, 不命中持仓的不入库 (飞书 + 网页都看不到)
+        hits = match_holdings(ev)
+        if not hits:
+            skipped += 1
+            continue
+        hit_syms = ','.join(s for s, _ in hits)
+
         is_new = save_event(
             source='cn_announcement',
             source_id=ev.get('source_id') or '',
-            symbol=ev.get('symbol'),
+            symbol=hit_syms,  # 2026-06-23 P0: 写命中持仓的 symbol, 不是公告本身
             title=ev.get('title', ''),
             url=ev.get('url', ''),
             pub_date=ev.get('pub_date') or '',
@@ -304,6 +383,10 @@ def run_announcement_stream(report_types: Optional[List[str]] = None, dry_run: b
             if dry_run:
                 print(f"    [DRY-RUN] 推 → {name}({sym}): {ev.get('title','')[:50]}")
             else:
+                # 跨源去重 (2026-06-20 P0): 巨潮可能在最近 30 分钟内推过同一条
+                if is_pushed_duplicate(sym, ev.get('title', ''), ev.get('pub_date', '')):
+                    print(f"    [跨源去重] 跳过 (30min 内 {sym} 已被任一 source 推过): {ev.get('title','')[:50]}")
+                    continue
                 if monitor_type == 'EVENT_DRIVEN':
                     send_keyword_news_alert(name, sym, ev.get('title',''), ev.get('url',''), keywords)
                 else:
@@ -323,8 +406,9 @@ def run_announcement_stream(report_types: Optional[List[str]] = None, dry_run: b
         'fetched': len(all_raw),
         'new_in_db': new_in_db,
         'pushed': pushed,
+        'skipped_non_portfolio': skipped,  # 2026-06-23 P0: 非持仓公告跳过数
     }
-    print(f"  [公告流] 新入库 {new_in_db}, 推送 {pushed}")
+    print(f"  [公告流] 新入库 {new_in_db}, 推送 {pushed}, 跳过(非持仓) {skipped}")
     return stats
 
 

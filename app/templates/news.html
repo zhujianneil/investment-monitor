@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>📊 投资监控 · 新闻回看</title>
+<link rel="stylesheet" href="/static/news.css">
+</head>
+<body>
+<header>
+  <div class="hd-inner">
+    <h1>📊 投资监控 · 新闻回看</h1>
+    <div class="stats" id="stats">
+      <span class="stat">加载中…</span>
+    </div>
+  </div>
+</header>
+
+<section class="tabs-bar">
+  <div class="tabs">
+    <button class="tab active" data-tab="pushed">📋 推送 <small>(<span id="tab-pushed-count">0</span>)</small></button>
+    <button class="tab" data-tab="all">📦 全部 <small>(<span id="tab-all-count">0</span>)</small></button>
+  </div>
+  <div class="stats" id="stats">
+    <span class="stat">加载中…</span>
+  </div>
+</section>
+
+<section class="filters">
+  <div class="filter-row">
+    <label>来源</label>
+    <div class="chips" id="src-chips"></div>
+  </div>
+  <div class="filter-row">
+    <label>标的</label>
+    <select id="sym-select">
+      <option value="">全部</option>
+    </select>
+    <label>时间</label>
+    <select id="days-select">
+      <option value="1">1 天</option>
+      <option value="3">3 天</option>
+      <option value="7" selected>7 天</option>
+      <option value="30">30 天</option>
+      <option value="0">全部</option>
+    </select>
+    <label class="cb">
+      <input type="checkbox" id="pushed-only"> 只看推送
+    </label>
+    <label class="cb">
+      <input type="checkbox" id="enhanced-only"> 只看已增强
+    </label>
+  </div>
+  <div class="filter-row">
+    <input type="text" id="q-input" placeholder="搜索标题或内容…" style="flex:1">
+    <button id="enhance-btn" class="btn-secondary">✨ 补 LLM 增强 (50条)</button>
+  </div>
+</section>
+
+<main id="cards"></main>
+
+<div class="pager">
+  <button id="prev-btn">← 上一页</button>
+  <span id="page-info">1 / 1</span>
+  <button id="next-btn">下一页 →</button>
+</div>
+
+<div id="enhance-status" class="enhance-status hidden"></div>
+
+<script>
+const sourceMeta = {{ source_meta | tojson }};
+
+// ── 状态 ──
+let state = {
+  page: 1,
+  page_size: 30,
+  source: '',
+  symbol: '',
+  days: 7,
+  pushed_only: true,  // 默认: 推送 tab,只显示推送过的
+  enhanced_only: false,
+  q: '',
+  tab: 'pushed',  // 'pushed' | 'all'
+};
+
+// ── 工具 ──
+function esc(s) {
+  if (s == null) return '';
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+
+function fmtTime(t) {
+  if (!t) return '';
+  // 'YYYY-MM-DD HH:MM' or full ISO
+  return t.substring(5, 16); // MM-DD HH:MM
+}
+
+// ── 加载统计 ──
+async function loadStats() {
+  try {
+    const r = await fetch('/api/stats');
+    const s = await r.json();
+    document.getElementById('stats').innerHTML = `
+      <span class="stat">📦 总入库 <b>${s.total}</b></span>
+      <span class="stat">🎯 已推送 <b>${s.pushed_total}</b></span>
+      <span class="stat">📅 今日推送 <b>${s.pushed_today}</b></span>
+      <span class="stat">🤖 LLM 增强 <b>${s.enhanced}</b></span>
+    `;
+    // 更新 tab 角标
+    const pc = document.getElementById('tab-pushed-count');
+    const ac = document.getElementById('tab-all-count');
+    if (pc) pc.textContent = s.pushed_total.toLocaleString();
+    if (ac) ac.textContent = s.total.toLocaleString();
+  } catch (e) { console.error('loadStats', e); }
+}
+
+// ── 加载 source/symbol 选项 ──
+async function loadFilters() {
+  const r = await fetch('/api/filters');
+  const f = await r.json();
+
+  // 来源 chips
+  const chipsEl = document.getElementById('src-chips');
+  chipsEl.innerHTML = '';
+  const allBtn = document.createElement('button');
+  allBtn.className = 'chip active' + (state.source ? '' : ' active');
+  allBtn.textContent = '全部';
+  allBtn.onclick = () => { state.source = ''; loadList(); refreshChips(); };
+  chipsEl.appendChild(allBtn);
+  f.sources.forEach(s => {
+    const m = sourceMeta[s] || {label: s, color: '#888', icon: '•'};
+    const btn = document.createElement('button');
+    btn.className = 'chip';
+    btn.style.borderColor = m.color;
+    btn.innerHTML = `${m.icon} ${esc(m.label)} <small>(${s})</small>`;
+    btn.onclick = () => {
+      if (state.source === s) state.source = '';
+      else state.source = s;
+      loadList();
+      refreshChips();
+    };
+    chipsEl.appendChild(btn);
+  });
+
+  // 标的 select
+  const sel = document.getElementById('sym-select');
+  f.symbols.forEach(s => {
+    const opt = document.createElement('option');
+    opt.value = s;
+    opt.textContent = s;
+    sel.appendChild(opt);
+  });
+}
+
+function refreshChips() {
+  document.querySelectorAll('#src-chips .chip').forEach(c => {
+    const txt = c.textContent;
+    if (state.source === '') {
+      c.classList.toggle('active', txt.startsWith('全部'));
+    } else {
+      c.classList.toggle('active', txt.includes(state.source));
+    }
+  });
+}
+
+// ── 加载列表 ──
+async function loadList() {
+  const params = new URLSearchParams({
+    page: state.page,
+    page_size: state.page_size,
+    days: state.days,
+  });
+  if (state.source) params.set('source', state.source);
+  if (state.symbol) params.set('symbol', state.symbol);
+  if (state.pushed_only) params.set('pushed_only', '1');
+  if (state.q) params.set('q', state.q);
+
+  const r = await fetch('/api/events?' + params);
+  const data = await r.json();
+
+  const cards = document.getElementById('cards');
+  if (!data.items.length) {
+    cards.innerHTML = '<div class="empty">没有匹配的新闻</div>';
+  } else {
+    cards.innerHTML = data.items.map(renderCard).join('');
+  }
+
+  // 客户端再过滤 enhanced_only
+  if (state.enhanced_only) {
+    cards.querySelectorAll('.card').forEach(c => {
+      if (!c.dataset.enhanced) c.remove();
+    });
+  }
+
+  document.getElementById('page-info').textContent =
+    `${data.page} / ${data.pages} (共 ${data.total} 条)`;
+  document.getElementById('prev-btn').disabled = data.page <= 1;
+  document.getElementById('next-btn').disabled = data.page >= data.pages;
+}
+
+function renderCard(r) {
+  const m = r.source_meta || {label: r.source, color: '#888', icon: '•'};
+  const sev = (r.llm_severity || '').toLowerCase();
+  const sevBadge = {
+    'high': '<span class="sev sev-high">🔴 HIGH</span>',
+    'medium': '<span class="sev sev-mid">🟡 MED</span>',
+    'low': '<span class="sev sev-low">⚪ LOW</span>',
+  }[sev] || '';
+
+  const sent = r.llm_sentiment != null
+    ? `<span class="sent sent-${r.llm_sentiment >= 0 ? 'pos' : 'neg'}">
+         ${r.llm_sentiment >= 0 ? '📈' : '📉'}
+         ${(r.llm_sentiment * 100).toFixed(0)}
+       </span>` : '';
+
+  const themes = (r.llm_themes || []).map(t => `<span class="theme">${esc(t)}</span>`).join('');
+  const relevance = r.relevance && r.relevance !== 'primary'
+    ? `<span class="relevance rel-${esc(r.relevance)}">${esc(r.relevance)}</span>` : '';
+
+  const pushedBadge = r.pushed
+    ? '<span class="pushed">✓ 已推</span>' : '';
+
+  const link = r.url ? `<a href="${esc(r.url)}" target="_blank" rel="noopener">原文 ↗</a>` : '';
+
+  const summary = r.llm_summary
+    ? `<div class="summary">💡 ${esc(r.llm_summary)}</div>` : '';
+
+  const content = r.content
+    ? `<div class="content collapsed">${esc(r.content).substring(0, 280)}${r.content.length > 280 ? '…' : ''}</div>` : '';
+
+  return `
+  <div class="card ${r.pushed ? 'pushed' : ''}" data-enhanced="${r.llm_summary ? '1' : '0'}">
+    <div class="card-head">
+      <span class="src" style="background:${m.color}">${m.icon} ${esc(m.label)}</span>
+      ${r.symbol_display ? `<span class="sym">${esc(r.symbol_display)}</span>` : ''}
+      ${sevBadge}
+      ${sent}
+      ${relevance}
+      ${pushedBadge}
+    </div>
+    <div class="title">${esc(r.title)}</div>
+    ${summary}
+    ${content}
+    <div class="card-foot">
+      <span class="time">📅 ${esc(r.pub_date_str)}</span>
+      <span class="time">⏱ 入库 ${esc(r.fetched_at_str)}</span>
+      ${themes}
+      ${link}
+    </div>
+  </div>`;
+}
+
+// ── 事件绑定 ──
+document.getElementById('days-select').onchange = (e) => {
+  state.days = parseInt(e.target.value);
+  state.page = 1;
+  loadList();
+};
+document.getElementById('sym-select').onchange = (e) => {
+  state.symbol = e.target.value;
+  state.page = 1;
+  loadList();
+};
+document.getElementById('pushed-only').onchange = (e) => {
+  state.pushed_only = e.target.checked;
+  state.page = 1;
+  loadList();
+};
+
+// ── Tab 切换 ──
+document.querySelectorAll('.tab').forEach(btn => {
+  btn.onclick = () => {
+    const tab = btn.dataset.tab;
+    state.tab = tab;
+    state.pushed_only = (tab === 'pushed');
+    // 同步 checkbox 状态
+    const cb = document.getElementById('pushed-only');
+    if (cb) cb.checked = state.pushed_only;
+    // active class
+    document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t === btn));
+    state.page = 1;
+    loadList();
+  };
+});
+document.getElementById('enhanced-only').onchange = (e) => {
+  state.enhanced_only = e.target.checked;
+  loadList();
+};
+let qTimer = null;
+document.getElementById('q-input').oninput = (e) => {
+  clearTimeout(qTimer);
+  qTimer = setTimeout(() => {
+    state.q = e.target.value;
+    state.page = 1;
+    loadList();
+  }, 350);
+};
+document.getElementById('prev-btn').onclick = () => {
+  if (state.page > 1) { state.page--; loadList(); }
+};
+document.getElementById('next-btn').onclick = () => {
+  state.page++;
+  loadList();
+};
+document.getElementById('enhance-btn').onclick = async () => {
+  const btn = document.getElementById('enhance-btn');
+  const st = document.getElementById('enhance-status');
+  btn.disabled = true;
+  st.classList.remove('hidden');
+  st.textContent = '⏳ 后台启动 LLM 增强,50 条…';
+  try {
+    const r = await fetch('/api/enhance', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({limit: 50})
+    });
+    const j = await r.json();
+    st.textContent = j.started
+      ? '✅ 已启动,稍后刷新页面看摘要 (约 30-60s)'
+      : '⏳ 已有任务在跑,请等待...';
+  } catch (e) {
+    st.textContent = '❌ 启动失败: ' + e.message;
+  }
+  setTimeout(() => { btn.disabled = false; }, 5000);
+};
+
+// ── 启动 ──
+loadStats();
+loadFilters();
+loadList();
+setInterval(loadStats, 60000); // 1 min 刷新一次统计
+</script>
+</body>
+</html>

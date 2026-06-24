@@ -36,6 +36,8 @@ from models import (
 )
 from data_sources import health_check as ds_health_check
 from feishu_push import _send, replay_dlq
+from ah_render import run as run_ah_dashboard
+from lhb_stream import run_lhb_stream
 
 tz = pytz.timezone('Asia/Shanghai')
 
@@ -175,6 +177,54 @@ def job_weekly_digest():
     """每周日：周报推送"""
     print("\n>>> [每周] 周报生成")
     send_weekly_report()
+
+
+# ── AH 看板 (2026-06-22 新增) ────────────────────────────────
+def job_ah_dashboard_daily():
+    """
+    每个交易日 18:00 跑一次：
+      1. 采集三源数据（ah_premium / southbound / usdhkd）
+      2. 计算信号（动态分位 + 三因子交叉）
+      3. 渲染 HTML 看板到 reports/ah_premium_YYYYMMDD.html
+      4. 推 Feishu 卡片到 DM
+
+    强信号（STRONG_CONVERGE / DIVERGE_ACCELERATING）已通过红色标题在常规卡片里突出，不再额外推避免刷屏
+    """
+    try:
+        data = run_ah_dashboard(do_fetch=True, push_feishu=True)
+        n = len(data.get("signals", []))
+        strong = len(data.get("strong_signals", []))
+        print(f"  [AH 看板] ✓ 已生成 (信号 {n} 个, 强信号 {strong} 个)")
+    except Exception as e:
+        print(f"  [AH 看板] ✗ 失败: {e}")
+        raise
+
+
+# ── 龙虎榜异动 (2026-06-22 新增) ─────────────────────────────
+def job_lhb_daily():
+    """
+    每个交易日 16:00 跑一次（15:30 上交所/深交所公布当日龙虎榜）:
+      1. 调广发 gf-skills MCP 接口拉 sh+sz 当日全市场龙虎榜
+      2. 跟 PORTFOLIO 持仓做精确 symbol 匹配
+      3. 命中 → 推飞书红色告警 (官方异动阈值, 比 ±5% 准)
+      4. 全市场清单入 events 表 (source='gf_lhb') 供回看
+
+    频次: 1 天 1 次够 (龙虎榜盘后才公布, 盘中永远是空)
+    兜底: 16:00 / 18:00 双跑, 防止广发接口首次不稳定
+    """
+    return run_lhb_stream()
+
+
+def job_ah_history_backfill():
+    """周日晚回填一周历史，确保数据连续。"""
+    try:
+        from ah_fetcher import fetch_ah_premium_history, fetch_usdhkd_history
+        fetch_ah_premium_history(400)
+        fetch_usdhkd_history(400)
+        print("  [AH 历史] ✓ 回填完成")
+    except Exception as e:
+        print(f"  [AH 历史] ✗ 回填失败: {e}")
+        raise
 
 
 def job_data_source_health():
@@ -389,6 +439,38 @@ def start():
         name='数据源健康检查',
     )
 
+    # ── AH 溢价看板日报 (2026-06-22 新增) ──
+    # 每个交易日 18:00 跑：采集+分析+渲染 HTML+推 Feishu 卡片
+    scheduler.add_job(
+        lambda: _wrap('ah_dashboard_daily', job_ah_dashboard_daily),
+        CronTrigger(day_of_week='mon-fri', hour='18', minute='0', timezone=tz),
+        id='ah_dashboard_daily',
+        name='AH 溢价看板日报',
+    )
+    # 每周日 20:30 跑一次历史回填（补周末缺数据）
+    scheduler.add_job(
+        lambda: _wrap('ah_history_backfill', job_ah_history_backfill),
+        CronTrigger(day_of_week='sun', hour='20', minute='30', timezone=tz),
+        id='ah_history_backfill',
+        name='AH 历史回填',
+    )
+
+    # ── 龙虎榜异动 (2026-06-22 新增) ──
+    # 15:30 上交所/深交所公布当日龙虎榜 → 16:00 拉取最稳
+    # 18:00 再跑一次兜底（广发接口可能 16:00 还没刷新）
+    scheduler.add_job(
+        lambda: _wrap('lhb_daily', job_lhb_daily),
+        CronTrigger(day_of_week='mon-fri', hour='16', minute='0', timezone=tz),
+        id='lhb_daily',
+        name='龙虎榜异动 (主)',
+    )
+    scheduler.add_job(
+        lambda: _wrap('lhb_daily_backup', job_lhb_daily),
+        CronTrigger(day_of_week='mon-fri', hour='18', minute='5', timezone=tz),
+        id='lhb_daily_backup',
+        name='龙虎榜异动 (兜底)',
+    )
+
     # ── 看门狗（每 2 小时，2026-06-11 新增）──
     scheduler.add_job(
         lambda: _wrap('watchdog', job_watchdog),
@@ -406,6 +488,8 @@ def start():
     print("  · 每日新闻公告：每天 09:00")
     print("  · 每周摘要报告：每周日 20:00")
     print("  · 数据源健康检查：每 6 小时")
+    print("  · 龙虎榜异动：工作日 16:00 / 18:05（兜底）")
+    print("  · AH 溢价看板：工作日 18:00 / 周日 20:30 回填")
     print("  · 看门狗：每 2 小时")
     print("\n  EXIT_PENDING 持仓（海尔智家、福耀玻璃）已从监控中剔除")
     print("  监控原则：信息主动找你，你不主动找信息")
