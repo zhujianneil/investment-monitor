@@ -17,6 +17,7 @@ from flask import Flask, request, render_template, jsonify, abort
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import DB_PATH, PORTFOLIO  # noqa: E402
+from theses import THESES, get_thesis  # noqa: E402
 
 app = Flask(__name__)
 
@@ -208,6 +209,167 @@ def api_stats():
         'total': total,
         'by_source': by_source,
         'enhanced': enhanced,
+    })
+
+
+# ──────────────────── 持仓 thesis 追踪 (2026-06-24) ────────────────────
+
+def _fmt_dt(s, fmt='%m-%d %H:%M'):
+    if not s:
+        return ''
+    try:
+        return datetime.fromisoformat(s).strftime(fmt)
+    except Exception:
+        return str(s)[:16]
+
+
+def _thesis_table_exists(cur) -> bool:
+    try:
+        r = cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='thesis_links'"
+        ).fetchone()
+        return r is not None
+    except Exception:
+        return False
+
+
+@app.route('/thesis')
+def thesis_overview_page():
+    return render_template('thesis.html', symbol='', source_meta=SOURCE_META)
+
+
+@app.route('/thesis/<path:symbol>')
+def thesis_detail_page(symbol):
+    return render_template('thesis.html', symbol=symbol, source_meta=SOURCE_META)
+
+
+@app.route('/api/thesis')
+def api_thesis_overview():
+    """总览:每只持仓各支柱的 支持/削弱/中性 计数。"""
+    conn = get_db()
+    cur = conn.cursor()
+    have_tbl = _thesis_table_exists(cur)
+
+    holdings = []
+    for symbol, th in THESES.items():
+        # 计数(按 assumption_id + stance)
+        counts = {}
+        last_at = ''
+        if have_tbl:
+            try:
+                for aid, stance, n in cur.execute(
+                    '''SELECT assumption_id, stance, COUNT(*) FROM thesis_links
+                       WHERE symbol = ? AND assumption_id != '__none__'
+                       GROUP BY assumption_id, stance''', (symbol,)):
+                    counts.setdefault(aid, {'support': 0, 'weaken': 0, 'neutral': 0})
+                    if stance in counts[aid]:
+                        counts[aid][stance] = n
+                row = cur.execute(
+                    '''SELECT MAX(e.fetched_at) FROM thesis_links tl
+                       JOIN events e ON e.id = tl.event_id
+                       WHERE tl.symbol = ? AND tl.assumption_id != '__none__' ''',
+                    (symbol,)).fetchone()
+                last_at = row[0] if row else ''
+            except Exception:
+                pass
+
+        assumptions = []
+        tot = {'support': 0, 'weaken': 0, 'neutral': 0}
+        for a in th.get('assumptions', []):
+            c = counts.get(a['id'], {'support': 0, 'weaken': 0, 'neutral': 0})
+            total = c['support'] + c['weaken'] + c['neutral']
+            for k in tot:
+                tot[k] += c[k]
+            assumptions.append({
+                'id': a['id'], 'label': a['label'],
+                'support': c['support'], 'weaken': c['weaken'],
+                'neutral': c['neutral'], 'total': total,
+            })
+
+        holdings.append({
+            'symbol': symbol,
+            'name': th.get('name', symbol),
+            'summary': th.get('summary', ''),
+            'assumptions': assumptions,
+            'totals': {**tot, 'linked': tot['support'] + tot['weaken'] + tot['neutral']},
+            'last_event_at': _fmt_dt(last_at),
+        })
+
+    conn.close()
+    return jsonify({'holdings': holdings, 'ready': have_tbl})
+
+
+@app.route('/api/thesis/<path:symbol>')
+def api_thesis_detail(symbol):
+    """详情:某持仓每条假设下的证据流。"""
+    th = get_thesis(symbol)
+    if not th:
+        return jsonify({'error': 'no thesis for symbol', 'symbol': symbol}), 404
+
+    conn = get_db()
+    cur = conn.cursor()
+    have_tbl = _thesis_table_exists(cur)
+
+    # 取该 symbol 所有已归档(非 __none__)的 event + link
+    by_aid = {}
+    if have_tbl:
+        try:
+            rows = cur.execute(
+                '''SELECT tl.assumption_id, tl.stance, tl.confidence, tl.rationale,
+                          e.id, e.source, e.symbol, e.title, e.url,
+                          e.pub_date, e.fetched_at, e.llm_summary,
+                          e.llm_sentiment, e.llm_severity, e.pushed
+                   FROM thesis_links tl
+                   JOIN events e ON e.id = tl.event_id
+                   WHERE tl.symbol = ? AND tl.assumption_id != '__none__'
+                   ORDER BY e.pub_date DESC, e.fetched_at DESC''', (symbol,)).fetchall()
+            for r in rows:
+                d = dict(r)
+                aid = d['assumption_id']
+                meta = SOURCE_META.get(d['source'], {'label': d['source'], 'color': '#888', 'icon': '•'})
+                by_aid.setdefault(aid, []).append({
+                    'event_id': d['id'],
+                    'stance': d['stance'],
+                    'confidence': d['confidence'],
+                    'rationale': d['rationale'],
+                    'source': d['source'],
+                    'source_label': meta['label'],
+                    'source_color': meta['color'],
+                    'source_icon': meta['icon'],
+                    'title': d['title'],
+                    'url': d['url'],
+                    'pub_date_str': _fmt_dt(d['pub_date']),
+                    'fetched_at_str': _fmt_dt(d['fetched_at']),
+                    'llm_summary': d['llm_summary'],
+                    'llm_sentiment': d['llm_sentiment'],
+                    'llm_severity': d['llm_severity'],
+                    'pushed': d['pushed'],
+                })
+        except Exception:
+            pass
+    conn.close()
+
+    assumptions = []
+    for a in th.get('assumptions', []):
+        evs = by_aid.get(a['id'], [])
+        sc = {'support': 0, 'weaken': 0, 'neutral': 0}
+        for e in evs:
+            if e['stance'] in sc:
+                sc[e['stance']] += 1
+        assumptions.append({
+            'id': a['id'], 'label': a['label'],
+            'statement': a.get('statement', ''),
+            'breaks_if': a.get('breaks_if', ''),
+            'stance_counts': sc,
+            'events': evs,
+        })
+
+    return jsonify({
+        'symbol': symbol,
+        'name': th.get('name', symbol),
+        'summary': th.get('summary', ''),
+        'assumptions': assumptions,
+        'ready': have_tbl,
     })
 
 

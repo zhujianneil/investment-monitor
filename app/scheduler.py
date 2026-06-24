@@ -25,6 +25,7 @@ from announcement_stream import run_announcement_stream
 from yf_news_stream import run_yf_news_stream
 from cls_stream import run_cls_stream
 from llm_enhancer import enhance_pending_events, is_available as llm_available
+from thesis_tracker import run_thesis_tracker
 from earnings_calendar import check_earnings_calendar
 from weekly_digest import send_weekly_report
 from cninfo_stream import run_cninfo_stream
@@ -171,6 +172,19 @@ def job_llm_enhance():
         return {'disabled': True}
     print("\n>>> [LLM 增强] 处理未增强 events")
     return enhance_pending_events(batch_size=20)
+
+
+def job_thesis_track():
+    """
+    持仓 thesis 归档 (2026-06-24 新增) — 第三层
+    每 15 分钟扫一次"有 thesis 的 symbol"的未归档 events,
+    LLM 判命中假设 + 支持/削弱/中性。LLM 未配时降级跳过。
+    """
+    if not llm_available():
+        print("\n>>> [thesis 归档] 未配置 LLM, 跳过")
+        return {'disabled': True}
+    print("\n>>> [thesis 归档] 处理未归档 events")
+    return run_thesis_tracker(batch_size=30)
 
 
 def job_weekly_digest():
@@ -423,6 +437,15 @@ def start():
         name='LLM 事件增强',
     )
 
+    # ── 持仓 thesis 归档 (2026-06-24 新增) ──
+    # 15min 一次, 跟在 llm_enhance 之后 (错峰 :9/:24/:39/:54), key 未配时降级跳过
+    scheduler.add_job(
+        lambda: _wrap('thesis_track', job_thesis_track),
+        CronTrigger(minute='9,24,39,54', timezone=tz),
+        id='thesis_track',
+        name='持仓 thesis 归档',
+    )
+
     # ── 每周日 20:00 周报 ──
     scheduler.add_job(
         lambda: _wrap('weekly_digest', job_weekly_digest),
@@ -502,6 +525,7 @@ def start():
     _wrap('init_announcement_stream', job_announcement_stream)  # 2026-06-19 立即跑一次抓当日
     _wrap('init_yf_news', job_yf_news_stream)  # 2026-06-19 立即跑一次抓港美股
     _wrap('init_cls_stream', job_cls_stream)  # 2026-06-19 P1 立即跑一次 7×24
+    _wrap('init_thesis_track', job_thesis_track)  # 2026-06-24 启动回填一次 thesis 归档
 
     print("\n  开始定时调度...")
     scheduler.start()

@@ -147,6 +147,30 @@ def init_db():
     )
     ''')
 
+    # ── 持仓 thesis 归档表（2026-06-24 新增）──────────────────
+    # 把 events 归档到某持仓的某条假设(支柱)下,并判 支持/削弱/中性。
+    # 由 thesis_tracker.py(scheduler 进程)写入,web_view 只读。
+    # 一条 event 只保留一条 link(取最相关假设)→ UNIQUE(event_id)。
+    # assumption_id='__none__' = 已被 LLM 处理但与任何假设无关(防重复处理)。
+    # thesis_version = 该 symbol 假设集的哈希;假设改动后版本变 → 自动重判。
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS thesis_links (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id INTEGER NOT NULL,
+        symbol TEXT NOT NULL,
+        assumption_id TEXT NOT NULL,      -- theses.py 里的 assumption id 或 '__none__'
+        stance TEXT,                      -- 'support' | 'weaken' | 'neutral'
+        confidence REAL,                  -- 0 ~ 1
+        rationale TEXT,                   -- 一句话理由
+        method TEXT DEFAULT 'llm',        -- 'llm' | 'manual'
+        thesis_version TEXT,              -- 该 symbol 假设集哈希(版本)
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(event_id)
+    )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_thesis_symbol ON thesis_links(symbol)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_thesis_assumption ON thesis_links(symbol, assumption_id)')
+
     conn.commit()
     conn.close()
     print("数据库初始化完成")

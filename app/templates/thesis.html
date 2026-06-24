@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>🎯 持仓逻辑 · thesis 追踪</title>
+<link rel="stylesheet" href="/static/news.css">
+<style>
+/* ── thesis 页面专属(复用 news.css 的 CSS 变量)── */
+.wrap { max-width: 1320px; margin: 0 auto; padding: 0 18px; }
+.crumbs { max-width: 1320px; margin: 16px auto 4px; padding: 0 18px; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.crumbs a { color: var(--accent-d); text-decoration:none; font-size:13px; font-weight:600; }
+.crumbs a:hover { text-decoration:underline; }
+.crumbs .sep { color: var(--faint); }
+
+.th-summary-bar {
+  max-width: 1320px; margin: 6px auto 0; padding: 14px 18px;
+  background: linear-gradient(180deg,#fbfcff,#f4f8ff); border:1px solid #e8eefb;
+  border-radius: var(--r-lg); color:#364152; font-size:14px; line-height:1.6;
+}
+.th-summary-bar b { color: var(--ink); }
+
+/* 总览网格 */
+.th-grid {
+  max-width: 1320px; margin: 18px auto 40px; padding: 0 18px;
+  display:grid; grid-template-columns: repeat(auto-fill, minmax(380px,1fr)); gap:16px; align-items:start;
+}
+.th-card {
+  background: var(--surface); border:1px solid var(--line); border-radius: var(--r-lg);
+  box-shadow: var(--sh-card); padding:16px 17px 12px; display:flex; flex-direction:column; gap:11px;
+  transition: box-shadow .18s, transform .18s, border-color .18s;
+}
+.th-card:hover { box-shadow: var(--sh-pop); border-color:#d7dde6; transform: translateY(-2px); }
+.th-card-head { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.th-card-head .sym-name { font-size:15.5px; font-weight:700; color:var(--ink); text-decoration:none; }
+.th-card-head .sym-name:hover { color: var(--accent-d); }
+.th-updated { font-size:11px; color:var(--faint); white-space:nowrap; }
+.th-card .lede { font-size:12.5px; color:var(--muted); line-height:1.5;
+  display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+
+.pillars { display:flex; flex-direction:column; gap:6px; margin-top:2px; }
+.pillar { display:flex; align-items:center; justify-content:space-between; gap:8px;
+  padding:7px 9px; border:1px solid var(--line-2); border-radius:var(--r-sm); background:var(--surface-2); }
+.pillar .plabel { font-size:12.5px; font-weight:600; color:var(--text); }
+.pillar .pcounts { display:inline-flex; gap:5px; }
+.cpill { font-size:11px; font-weight:700; padding:2px 7px; border-radius:var(--r-pill);
+  font-variant-numeric:tabular-nums; }
+.c-sup { color: var(--pos); background: var(--pos-bg); }
+.c-weak{ color: var(--neg); background: var(--neg-bg); }
+.c-neu { color: var(--muted); background: var(--surface-2); border:1px solid var(--line); }
+.c-zero{ color: var(--faint); background: transparent; border:1px dashed var(--line); }
+
+/* 详情:每条假设 */
+.assump { max-width:1320px; margin:16px auto; padding:0 18px; }
+.assump-box { background:var(--surface); border:1px solid var(--line); border-radius:var(--r-lg);
+  box-shadow:var(--sh-card); overflow:hidden; }
+.assump-head { display:flex; align-items:center; justify-content:space-between; gap:12px;
+  padding:14px 18px; border-bottom:1px solid var(--line-2); background:var(--surface-2); flex-wrap:wrap; }
+.assump-head h3 { margin:0; font-size:15px; font-weight:700; color:var(--ink); display:flex; align-items:center; gap:8px; }
+.assump-body { padding:12px 18px 16px; }
+.bet { font-size:13px; color:#364152; margin:0 0 6px; }
+.bet b, .breaks b { color:var(--ink); }
+.breaks { font-size:12.5px; color:var(--muted); margin:0 0 12px; padding:8px 11px;
+  background:#fff8f3; border:1px solid #fde4d4; border-radius:var(--r-md); }
+
+.evlist { display:flex; flex-direction:column; gap:9px; }
+.ev { border:1px solid var(--line); border-left-width:3px; border-radius:var(--r-md);
+  padding:10px 12px; background:var(--surface); }
+.ev.support { border-left-color: var(--pos); }
+.ev.weaken  { border-left-color: var(--neg); }
+.ev.neutral { border-left-color: var(--faint); }
+.ev-top { display:flex; align-items:center; gap:7px; flex-wrap:wrap; margin-bottom:5px; }
+.stance { font-size:10.5px; font-weight:800; padding:2px 8px; border-radius:var(--r-pill); letter-spacing:.3px; }
+.stance.support { color:var(--pos); background:var(--pos-bg); }
+.stance.weaken  { color:var(--neg); background:var(--neg-bg); }
+.stance.neutral { color:var(--muted); background:var(--surface-2); }
+.ev .src { font-size:11px; }
+.ev-time { font-size:11px; color:var(--faint); font-variant-numeric:tabular-nums; }
+.ev-title { font-size:14px; font-weight:650; color:var(--ink); line-height:1.4; }
+.ev-title a { color:inherit; text-decoration:none; }
+.ev-title a:hover { color:var(--accent-d); text-decoration:underline; }
+.ev-why { font-size:12.5px; color:#475063; margin-top:4px; }
+.ev-why .tag { color:var(--accent-d); font-weight:700; }
+.ev-empty { font-size:12.5px; color:var(--faint); padding:6px 2px; }
+.conf { font-size:10.5px; color:var(--faint); }
+
+.notice { max-width:1320px; margin:24px auto; padding:40px 20px; text-align:center;
+  color:var(--faint); font-size:14px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="hd-inner">
+    <h1>🎯 持仓逻辑 · <span id="hd-sub">thesis 追踪</span></h1>
+    <div class="stats">
+      <a class="stat" href="/" style="text-decoration:none;color:#aeb8c9">← 回新闻看板</a>
+    </div>
+  </div>
+</header>
+
+<div class="crumbs" id="crumbs"></div>
+<div id="root"></div>
+
+<script>
+const SYMBOL = "{{ symbol|e }}";
+const sourceMeta = {{ source_meta | tojson }};
+
+function esc(s){ if(s==null) return ''; return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function cpill(n, cls){ return `<span class="cpill ${n>0?cls:'c-zero'}">${n}</span>`; }
+
+// ── 总览 ──
+async function loadOverview(){
+  document.getElementById('crumbs').innerHTML = `<span class="sep">持仓逻辑总览</span>`;
+  const root = document.getElementById('root');
+  let data;
+  try { data = await (await fetch('/api/thesis')).json(); }
+  catch(e){ root.innerHTML = `<div class="notice">加载失败: ${esc(e.message)}</div>`; return; }
+
+  if(!data.holdings || !data.holdings.length){
+    root.innerHTML = `<div class="notice">还没有定义任何持仓逻辑。<br>在 <code>theses.py</code> 里添加即可。</div>`;
+    return;
+  }
+  const readyNote = data.ready ? '' :
+    `<div class="notice" style="padding:14px;color:var(--muted)">⏳ thesis 归档表尚未建立或还没归档数据,等调度跑一轮(约 15 分钟内)或重启服务后刷新。</div>`;
+
+  root.innerHTML = readyNote + '<div class="th-grid">' + data.holdings.map(h => `
+    <div class="th-card">
+      <div class="th-card-head">
+        <a class="sym-name" href="/thesis/${encodeURIComponent(h.symbol)}">${esc(h.symbol)} · ${esc(h.name)}</a>
+        ${h.last_event_at ? `<span class="th-updated">最近 ${esc(h.last_event_at)}</span>` : ''}
+      </div>
+      <div class="lede">${esc(h.summary)}</div>
+      <div class="pillars">
+        ${h.assumptions.map(a => `
+          <div class="pillar">
+            <span class="plabel">${esc(a.label)}</span>
+            <span class="pcounts">
+              ${cpill(a.support,'c-sup')}${cpill(a.weaken,'c-weak')}${cpill(a.neutral,'c-neu')}
+            </span>
+          </div>`).join('')}
+      </div>
+    </div>`).join('') + '</div>';
+}
+
+// ── 详情 ──
+async function loadDetail(sym){
+  const root = document.getElementById('root');
+  let d;
+  try {
+    const r = await fetch('/api/thesis/' + encodeURIComponent(sym));
+    if(r.status === 404){ root.innerHTML = `<div class="notice">${esc(sym)} 还没有定义投资逻辑。<br><a href="/thesis">← 返回总览</a></div>`; return; }
+    d = await r.json();
+  } catch(e){ root.innerHTML = `<div class="notice">加载失败: ${esc(e.message)}</div>`; return; }
+
+  document.getElementById('hd-sub').textContent = d.name;
+  document.getElementById('crumbs').innerHTML =
+    `<a href="/thesis">持仓逻辑总览</a><span class="sep">›</span><span>${esc(d.symbol)} · ${esc(d.name)}</span>`;
+
+  let html = `<div class="th-summary-bar"><b>总论点:</b> ${esc(d.summary)}</div>`;
+
+  html += d.assumptions.map(a => {
+    const sc = a.stance_counts || {support:0,weaken:0,neutral:0};
+    const evs = a.events || [];
+    const evHtml = evs.length ? evs.map(ev => {
+      const m = sourceMeta[ev.source] || {label:ev.source,color:'#888',icon:'•'};
+      const stanceTxt = {support:'支持',weaken:'削弱',neutral:'中性'}[ev.stance] || ev.stance;
+      const conf = (ev.confidence!=null) ? `<span class="conf">置信 ${(ev.confidence*100).toFixed(0)}%</span>` : '';
+      const link = ev.url ? `<a href="${esc(ev.url)}" target="_blank" rel="noopener">${esc(ev.title)} ↗</a>` : esc(ev.title);
+      return `
+        <div class="ev ${esc(ev.stance)}">
+          <div class="ev-top">
+            <span class="stance ${esc(ev.stance)}">${stanceTxt}</span>
+            <span class="src" style="background:${m.color};color:#fff;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:650">${m.icon} ${esc(m.label)}</span>
+            <span class="ev-time">📅 ${esc(ev.pub_date_str||ev.fetched_at_str||'')}</span>
+            ${conf}
+          </div>
+          <div class="ev-title">${link}</div>
+          ${ev.rationale ? `<div class="ev-why"><span class="tag">判断:</span> ${esc(ev.rationale)}</div>` : ''}
+          ${ev.llm_summary ? `<div class="ev-why">💡 ${esc(ev.llm_summary)}</div>` : ''}
+        </div>`;
+    }).join('') : `<div class="ev-empty">暂无归档证据</div>`;
+
+    return `
+    <div class="assump">
+      <div class="assump-box">
+        <div class="assump-head">
+          <h3>${esc(a.label)}</h3>
+          <span class="pcounts">
+            ${cpill(sc.support,'c-sup')}${cpill(sc.weaken,'c-weak')}${cpill(sc.neutral,'c-neu')}
+          </span>
+        </div>
+        <div class="assump-body">
+          ${a.statement ? `<p class="bet"><b>赌注:</b> ${esc(a.statement)}</p>` : ''}
+          ${a.breaks_if ? `<p class="breaks"><b>被推翻条件:</b> ${esc(a.breaks_if)}</p>` : ''}
+          <div class="evlist">${evHtml}</div>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+
+  if(!d.ready){
+    html += `<div class="notice" style="color:var(--muted)">⏳ 归档数据还在生成,稍后刷新。</div>`;
+  }
+  root.innerHTML = html;
+}
+
+// ── 启动 ──
+if (SYMBOL) { loadDetail(SYMBOL); } else { loadOverview(); }
+</script>
+</body>
+</html>
