@@ -418,6 +418,81 @@ def _enhance_worker(limit: int):
             _enhancer_thread_started = False
 
 
+# ──────────────────── 信息精选 (info-digest) ────────────────────
+
+DIGEST_DB = os.getenv('DIGEST_DB_PATH',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'info-digest', 'digest.db'))
+
+
+def get_digest_db():
+    conn = sqlite3.connect(DIGEST_DB)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@app.route('/digest')
+def digest_page():
+    return render_template('digest.html')
+
+
+@app.route('/api/digest')
+def api_digest():
+    """信息精选 API"""
+    page = max(int(request.args.get('page', 1)), 1)
+    page_size = min(int(request.args.get('page_size', 20)), 100)
+    offset = (page - 1) * page_size
+
+    where = []
+    params = []
+
+    category = request.args.get('category', '')
+    if category:
+        where.append("s.category = ?")
+        params.append(category)
+
+    days = int(request.args.get('days', 7))
+    if days > 0:
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        where.append("s.created_at > ?")
+        params.append(cutoff)
+
+    if request.args.get('high_only'):
+        where.append("s.quality_score >= 8")
+
+    q = request.args.get('q', '').strip()
+    if q:
+        where.append("(s.one_liner LIKE ? OR s.insight LIKE ? OR c.title LIKE ?)")
+        params.extend([f'%{q}%'] * 3)
+
+    where_sql = ' AND '.join(where) if where else '1=1'
+
+    try:
+        conn = get_digest_db()
+        total = conn.execute(f"""
+            SELECT COUNT(*) FROM summaries s
+            JOIN content c ON s.content_id = c.id
+            WHERE {where_sql}
+        """, params).fetchone()[0]
+
+        rows = conn.execute(f"""
+            SELECT s.*, c.title, c.url, c.author, src.name as source_name
+            FROM summaries s
+            JOIN content c ON s.content_id = c.id
+            JOIN sources src ON c.source_id = src.id
+            WHERE {where_sql}
+            ORDER BY s.quality_score DESC, s.created_at DESC
+            LIMIT ? OFFSET ?
+        """, params + [page_size, offset]).fetchall()
+
+        conn.close()
+        items = [dict(r) for r in rows]
+    except Exception as e:
+        items = []
+        total = 0
+
+    return jsonify({'items': items, 'total': total, 'page': page})
+
+
 @app.route('/healthz')
 def healthz():
     return jsonify({'ok': True, 'ts': int(time.time())})

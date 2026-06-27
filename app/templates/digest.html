@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>🧠 信息精选 · 底层逻辑</title>
+<link rel="stylesheet" href="/static/news.css">
+<style>
+/* ── Digest 专属样式 ── */
+.digest-card {
+  background: var(--surface);
+  border-radius: var(--r-lg);
+  box-shadow: var(--sh-card);
+  padding: 24px 28px;
+  margin-bottom: 16px;
+  border-left: 4px solid var(--accent);
+  transition: transform .15s, box-shadow .15s;
+}
+.digest-card:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--sh-pop);
+}
+.digest-card.score-8 { border-left-color: var(--sev-high); }
+.digest-card.score-7 { border-left-color: var(--accent); }
+.digest-card.score-5 { border-left-color: var(--sev-low); }
+
+.digest-title {
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--ink);
+  margin-bottom: 6px;
+  line-height: 1.4;
+}
+.digest-title a {
+  color: inherit;
+  text-decoration: none;
+}
+.digest-title a:hover { color: var(--accent); }
+
+.digest-meta {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 14px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.digest-meta .badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 10px;
+  border-radius: var(--r-pill);
+  font-weight: 600;
+  font-size: 12px;
+}
+.badge-high { background: #fdecec; color: var(--sev-high); }
+.badge-mid  { background: #fff3e0; color: #e65100; }
+.badge-low  { background: var(--surface-2); color: var(--sev-low); }
+
+.digest-section {
+  margin-bottom: 12px;
+}
+.digest-section .label {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  color: var(--faint);
+  margin-bottom: 4px;
+}
+.digest-principle {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--ink);
+  line-height: 1.5;
+  padding: 10px 14px;
+  background: var(--accent-bg);
+  border-radius: var(--r-sm);
+}
+.digest-model, .digest-action, .digest-counter {
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text);
+  padding: 8px 14px;
+  border-radius: var(--r-sm);
+}
+.digest-model   { background: #f0f4ff; }
+.digest-action  { background: #e7f6ee; }
+.digest-counter { background: #fff8e1; }
+
+.digest-source {
+  font-size: 12px;
+  color: var(--faint);
+}
+.digest-source a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+/* header nav */
+.hd-nav-group {
+  display: flex;
+  gap: 12px;
+}
+.hd-nav {
+  font-size: 14px;
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 500;
+  padding: 4px 12px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line);
+  transition: all .15s;
+}
+.hd-nav:hover {
+  background: var(--accent-bg);
+  border-color: var(--accent);
+}
+.hd-nav.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="hd-inner">
+    <h1>🧠 信息精选 · 底层逻辑</h1>
+    <div class="hd-nav-group">
+      <a class="hd-nav" href="/">📊 投资监控</a>
+      <a class="hd-nav active" href="/digest">🧠 信息精选</a>
+    </div>
+    <div class="stats" id="stats">
+      <span class="stat">加载中…</span>
+    </div>
+  </div>
+</header>
+
+<section class="filters">
+  <div class="filter-row">
+    <label>分类</label>
+    <div class="chips" id="cat-chips"></div>
+    <label>时间</label>
+    <select id="days-select">
+      <option value="1">1 天</option>
+      <option value="3">3 天</option>
+      <option value="7" selected>7 天</option>
+      <option value="30">30 天</option>
+      <option value="0">全部</option>
+    </select>
+    <label class="cb">
+      <input type="checkbox" id="high-only"> 只看必读 (≥8)
+    </label>
+  </div>
+  <div class="filter-row">
+    <input type="text" id="q-input" placeholder="搜索底层逻辑…" style="flex:1">
+  </div>
+</section>
+
+<main id="cards"></main>
+
+<div class="pager">
+  <button id="prev-btn">← 上一页</button>
+  <span id="page-info">1 / 1</span>
+  <button id="next-btn">下一页 →</button>
+</div>
+
+<script>
+let state = { page: 1, page_size: 20, category: '', days: 7, high_only: false, q: '' };
+let totalCount = 0;
+
+function esc(s) {
+  if (s == null) return '';
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function badge(score) {
+  if (score >= 8) return '<span class="badge badge-high">🔴 必读 ' + score + '</span>';
+  if (score >= 7) return '<span class="badge badge-mid">🟡 推荐 ' + score + '</span>';
+  return '<span class="badge badge-low">🟢 ' + score + '</span>';
+}
+
+function parseInsight(insight) {
+  if (!insight) return {};
+  const r = {};
+  const lines = insight.split('\n');
+  for (const line of lines) {
+    if (line.includes('[底层逻辑]')) r.principle = line.replace(/\[底层逻辑\]\s*/, '').trim();
+    else if (line.includes('[思维模型]')) r.model = line.replace(/\[思维模型\]\s*/, '').trim();
+    else if (line.includes('[所以你应该]')) r.action = line.replace(/\[所以你应该\]\s*/, '').trim();
+    else if (line.includes('[反驳]')) r.counter = line.replace(/\[反驳\]\s*/, '').trim();
+  }
+  return r;
+}
+
+function renderCard(item) {
+  const ins = parseInsight(item.insight);
+  let html = '<div class="digest-card score-' + Math.floor(item.quality_score) + '">';
+  html += '<div class="digest-title">';
+  if (item.url) html += '<a href="' + esc(item.url) + '" target="_blank">' + esc(item.title) + '</a>';
+  else html += esc(item.title);
+  html += '</div>';
+  html += '<div class="digest-meta">' + badge(item.quality_score);
+  html += '<span class="digest-source">' + esc(item.source_name) + '</span>';
+  html += '<span>' + esc(item.category) + '</span>';
+  html += '</div>';
+
+  if (item.one_liner) {
+    html += '<div class="digest-section"><div class="label">⚡ 底层逻辑</div>';
+    html += '<div class="digest-principle">' + esc(item.one_liner) + '</div></div>';
+  }
+  if (ins.model) {
+    html += '<div class="digest-section"><div class="label">🧰 思维模型</div>';
+    html += '<div class="digest-model">' + esc(ins.model) + '</div></div>';
+  }
+  if (ins.action) {
+    html += '<div class="digest-section"><div class="label">👉 所以你应该</div>';
+    html += '<div class="digest-action">' + esc(ins.action) + '</div></div>';
+  }
+  if (ins.counter) {
+    html += '<div class="digest-section"><div class="label">⚔️ 反驳</div>';
+    html += '<div class="digest-counter">' + esc(ins.counter) + '</div></div>';
+  }
+  html += '</div>';
+  return html;
+}
+
+async function load() {
+  const p = new URLSearchParams();
+  p.set('page', state.page);
+  p.set('page_size', state.page_size);
+  if (state.category) p.set('category', state.category);
+  if (state.days) p.set('days', state.days);
+  if (state.high_only) p.set('high_only', '1');
+  if (state.q) p.set('q', state.q);
+
+  const resp = await fetch('/api/digest?' + p.toString());
+  const data = await resp.json();
+  totalCount = data.total || 0;
+
+  const cards = document.getElementById('cards');
+  if (!data.items || data.items.length === 0) {
+    cards.innerHTML = '<div style="text-align:center;color:var(--muted);padding:60px">暂无数据</div>';
+  } else {
+    cards.innerHTML = data.items.map(renderCard).join('');
+  }
+
+  document.getElementById('stats').innerHTML =
+    '<span class="stat">共 ' + totalCount + ' 条</span>';
+  document.getElementById('page-info').textContent =
+    state.page + ' / ' + Math.max(1, Math.ceil(totalCount / state.page_size));
+}
+
+// ── 分类 chips ──
+const CATEGORIES = ['投资', '产品', '管理', '行业', '科技', '创业', '思考', '其他'];
+function initChips() {
+  const container = document.getElementById('cat-chips');
+  let html = '<button class="chip active" data-cat="">全部</button>';
+  for (const c of CATEGORIES) {
+    html += '<button class="chip" data-cat="' + c + '">' + c + '</button>';
+  }
+  container.innerHTML = html;
+  container.addEventListener('click', e => {
+    const btn = e.target.closest('.chip');
+    if (!btn) return;
+    container.querySelectorAll('.chip').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    state.category = btn.dataset.cat;
+    state.page = 1;
+    load();
+  });
+}
+
+document.getElementById('days-select').addEventListener('change', e => {
+  state.days = parseInt(e.target.value); state.page = 1; load();
+});
+document.getElementById('high-only').addEventListener('change', e => {
+  state.high_only = e.target.checked; state.page = 1; load();
+});
+document.getElementById('q-input').addEventListener('input', e => {
+  state.q = e.target.value; state.page = 1; load();
+});
+document.getElementById('prev-btn').addEventListener('click', () => {
+  if (state.page > 1) { state.page--; load(); }
+});
+document.getElementById('next-btn').addEventListener('click', () => {
+  if (state.page * state.page_size < totalCount) { state.page++; load(); }
+});
+
+initChips();
+load();
+</script>
+</body>
+</html>
