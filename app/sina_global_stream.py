@@ -88,6 +88,9 @@ def fetch_sina_global_lid(lid: str, desc: str, num: int = 50,
 def match_holdings_global(item: Dict) -> List[tuple]:
     """
     国际财经流没有明确 symbol, 用 ticker + 公司名 + 关键词模糊匹配.
+    修复 2026-06-27: 加同 CN 一致的强约束 —
+    ticker 命中或持仓名命中: 算"主体相关", 可标 symbol
+    关键词命中 + 持仓名匹配: 主题相关, 可标 (例: 巴菲特 → 伯克希尔)
     """
     title = item.get('title', '')
     summary = ''  # 新浪 7×24 摘要字段在另一处
@@ -97,20 +100,42 @@ def match_holdings_global(item: Dict) -> List[tuple]:
     for sym, cfg in PORTFOLIO.items():
         if cfg.get('market') not in ('HK', 'US'):
             continue
-        # ticker 直接匹配
-        if sym.upper() in text.upper():
+        # ticker 直接匹配 (强约束, 必须 word boundary, 避免 "V" 匹配 "NVDA")
+        if _ticker_in_text(sym, text):
             hits.append((sym, cfg))
             continue
-        # 公司名
+        # 公司名 (强约束)
         name = cfg.get('name', '')
         if name and name in text:
             hits.append((sym, cfg))
             continue
-        # 关键词
+        # 关键词 (需配合持仓名/ticker, 否则会被行业词误命中)
         kws = cfg.get('news_keywords', [])
         if kws and any(kw in text for kw in kws):
-            hits.append((sym, cfg))
+            # 强约束: 持仓名 OR ticker 也必须在
+            ticker_variants = [sym]
+            if sym.endswith('.HK'):
+                ticker_variants.append(sym.split('.')[0])
+            ticker_variants.append(sym.upper())
+            has_strong = (name and (name in text or (len(name) >= 4 and name[:2] in text))) \
+                      or any(_ticker_in_text(t, text) for t in ticker_variants if t)
+            if has_strong:
+                hits.append((sym, cfg))
     return hits
+
+
+def _ticker_in_text(ticker: str, text: str) -> bool:
+    """
+    ticker 必须以 word boundary 出现在 text 中.
+    - 'NVDA' 必须作为独立词出现 (不算 "NVDAxx")
+    - 'V' 必须作为独立大写词出现 (不算 "NVDA" 中的 'V')
+    中文环境: \b 在 re.UNICODE 下不工作 (中文是 \\w), 改用非 \\w 字符作边界
+    """
+    import re
+    t = re.escape(ticker.upper())
+    # (?<![A-Za-z0-9]) 前面不是字母数字
+    # (?![A-Za-z0-9]) 后面不是字母数字
+    return bool(re.search(rf'(?<![A-Za-z0-9]){t}(?![A-Za-z0-9])', text))
 
 
 # ── 主流程 ───────────────────────────────────────────────────

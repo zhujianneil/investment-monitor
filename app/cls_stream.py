@@ -95,19 +95,36 @@ def fetch_sina_telegraph(lid: int = None, num: int = FETCH_NUM) -> List[Dict]:
 
 
 def match_holdings_sina(event: Dict) -> List[tuple]:
-    """和 announcement_stream.match_holdings 类似的关键词匹配, 跨市场"""
+    """
+    跨市场关键词匹配, 跟 announcement_stream 同步的强约束:
+    标到某持仓的硬条件 = (持仓名 OR ticker 出现在 title) AND (关键词命中)
+    只有关键词没有持仓名 → 不标 symbol (但保留作为主题信号)
+    修复 2026-06-27: 之前只关键词命中就标, 导致 002050「机器人」/688009「中标」/09992「出海」
+    等行业泛词把别家新闻错配到持仓
+    """
     title = event.get('title', '')
     hits = []
     for sym, cfg in PORTFOLIO.items():
         if cfg.get('monitor_type') == 'EXIT_PENDING':
             continue
         kws = cfg.get('news_keywords', [])
+        name = cfg.get('name', '')
         if not kws:
             continue
-        # 关键词 OR 名称
-        name = cfg.get('name', '')
-        if any(kw in title for kw in kws) or (name and name in title):
+        # 关键词必须命中
+        if not any(kw in title for kw in kws):
+            continue
+        # 强约束: 持仓名 OR ticker 必须在 title
+        # 持仓名支持前 2 字匹配 (例: 持仓名"小米集团"匹配"小米"开头)
+        ticker_variants = [sym]
+        if sym.endswith('.HK'):
+            ticker_variants.append(sym.split('.')[0])
+        ticker_variants.append(sym.upper())
+        has_strong = (name and (name in title or (len(name) >= 4 and name[:2] in title))) \
+                  or any(t in title for t in ticker_variants if t)
+        if has_strong:
             hits.append((sym, cfg))
+        # 否则: 主题相关, 不直接标 symbol
     return hits
 
 

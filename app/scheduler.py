@@ -29,6 +29,7 @@ from thesis_tracker import run_thesis_tracker
 from earnings_calendar import check_earnings_calendar
 from weekly_digest import send_weekly_report
 from cninfo_stream import run_cninfo_stream
+from sina_announcement_stream import run_sina_announcement_stream
 from sina_global_stream import run_sina_global_stream
 from models import (
     init_db, update_heartbeat, get_recent_source_failures,
@@ -145,12 +146,22 @@ def job_cls_stream():
 
 def job_cninfo_stream():
     """
-    巨潮公告流 (2026-06-19 P1 新增) — 公告流备源
+    巨潮公告流 (2026-06-19 P1 新增; 2026-06-25 v2 修) — 公告流 1 号源
     每 15 分钟拉一次 (错开东财流的 :00/:15/:30/:45),
-    抓今日全市场公告, 持仓命中推送.
+    抓今日全市场 (SSE + SZSE 并行 20 页) + 持仓 ticker 兜底
     """
-    print("\n>>> [巨潮] A 股公告备源")
+    print("\n>>> [巨潮] A 股公告 1 号源 (v2)")
     return run_cninfo_stream()
+
+
+def job_sina_announcement_stream():
+    """
+    新浪财经 vCB_AllBulletin 公告流 (2026-06-25 新增) — 公告流 备源
+    每小时一次, 9 只 A 股持仓 ticker 专属 HTML 解析
+    跟巨潮 + 东财 跨源去重, 互不重复推送
+    """
+    print("\n>>> [新浪公告] A 股备源 (vCB_AllBulletin)")
+    return run_sina_announcement_stream()
 
 
 def job_sina_global_stream():
@@ -409,14 +420,24 @@ def start():
         name='7×24 电报流',
     )
 
-    # ── 巨潮公告流 (2026-06-19 P1 新增, 公告流备源) ──
-    # 与东财 announcement_stream 并行, 主源失败时巨潮兜底
+    # ── 巨潮公告流 (2026-06-19 P1 新增, 公告流 1 号源; 2026-06-25 v2 修) ──
+    # 与东财 announcement_stream 并行, 巨潮是 1 号源 (官方, 数据质量最高)
     # 时分错开: 跑在 :10/:25/:40/:55, 避开其他流
     scheduler.add_job(
         lambda: _wrap('cninfo_stream', job_cninfo_stream),
         CronTrigger(minute='10,25,40,55', timezone=tz),
         id='cninfo_stream',
-        name='巨潮公告流 (备)',
+        name='巨潮公告流 (1号源)',
+    )
+
+    # ── 新浪 vCB_AllBulletin (2026-06-25 新增, 公告流备源) ──
+    # 1 小时一次, 9 只 A 股持仓 ticker 专属, 跟巨潮/东财 跨源去重
+    # 错开 cninfo (15min) 和 announcement_stream (15min), 单独节奏
+    scheduler.add_job(
+        lambda: _wrap('sina_announcement_stream', job_sina_announcement_stream),
+        CronTrigger(minute='20', timezone=tz),
+        id='sina_announcement_stream',
+        name='新浪公告流 (备源)',
     )
 
     # ── 新浪全球财经 (2026-06-19 P1 新增, 港美股新闻备) ──
@@ -525,6 +546,8 @@ def start():
     _wrap('init_announcement_stream', job_announcement_stream)  # 2026-06-19 立即跑一次抓当日
     _wrap('init_yf_news', job_yf_news_stream)  # 2026-06-19 立即跑一次抓港美股
     _wrap('init_cls_stream', job_cls_stream)  # 2026-06-19 P1 立即跑一次 7×24
+    _wrap('init_cninfo', job_cninfo_stream)  # 2026-06-25 立即跑一次巨潮 v2
+    _wrap('init_sina_announcement', job_sina_announcement_stream)  # 2026-06-25 立即跑一次新浪备源
     _wrap('init_thesis_track', job_thesis_track)  # 2026-06-24 启动回填一次 thesis 归档
 
     print("\n  开始定时调度...")
