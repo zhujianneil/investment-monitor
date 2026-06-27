@@ -12,8 +12,10 @@ services:
     volumes:
       - ./data:/app/data
       - ./reports:/app/reports
+      - C:/Users/sheng/info-digest:/app/info-digest:ro
     environment:
       - TZ=Asia/Shanghai
       - PYTHONUNBUFFERED=1
+      - DIGEST_DB_PATH=/app/info-digest/digest.db
     env_file:
       - .env
